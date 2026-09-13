@@ -1424,6 +1424,12 @@ pub struct GcPolicyOutcome {
     pub disk_bytes_reclaimed: u64,
     #[serde(default)]
     pub entries_unreclaimable: usize,
+    #[serde(default)]
+    pub entries_failed: usize,
+    #[serde(default)]
+    pub entries_locked: usize,
+    #[serde(default)]
+    pub evict_write_ms: u64,
 }
 
 impl From<&crate::store::GcStats> for GcPolicyOutcome {
@@ -1434,6 +1440,9 @@ impl From<&crate::store::GcStats> for GcPolicyOutcome {
             disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
+            entries_failed: stats.entries_failed,
+            entries_locked: stats.entries_locked,
+            evict_write_ms: stats.evict_write_ms,
         }
     }
 }
@@ -5633,7 +5642,12 @@ impl Daemon {
                     size,
                     self.config.max_size
                 );
-                let _ = store.evict();
+                // Under gc.lock like every driver, so the totals cannot race.
+                if let Ok(stats) = store.evict()
+                    && let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats)
+                {
+                    tracing::warn!("recording upload-triggered GC run: {e:#}");
+                }
             }
             Ok(())
         });
@@ -5817,6 +5831,15 @@ impl Daemon {
             disk_bytes_reclaimed: dedup_stats.disk_bytes_reclaimed
                 + evict_stats.disk_bytes_reclaimed
                 + age_evict_stats.disk_bytes_reclaimed,
+            entries_failed: dedup_stats.entries_failed
+                + evict_stats.entries_failed
+                + age_evict_stats.entries_failed,
+            entries_locked: dedup_stats.entries_locked
+                + evict_stats.entries_locked
+                + age_evict_stats.entries_locked,
+            evict_write_ms: dedup_stats.evict_write_ms
+                + evict_stats.evict_write_ms
+                + age_evict_stats.evict_write_ms,
         };
 
         tracing::info!(
@@ -5827,18 +5850,13 @@ impl Daemon {
             stats.duration_ms,
         );
 
-        // Persist GC stats for report consumption
-        let gc_stats_path = self.config.cache_dir.join("gc_stats.json");
-        let persisted = crate::report::GcStatsPersisted {
-            last_run: chrono::Utc::now().to_rfc3339(),
-            entries_evicted: stats.entries_evicted,
-            bytes_freed: stats.bytes_freed,
-            disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
-            blobs_removed: stats.blobs_removed,
-            duration_ms: stats.duration_ms,
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&persisted) {
-            let _ = std::fs::write(&gc_stats_path, json);
+        // Persist GC stats for reports and machine telemetry. Still under
+        // gc.lock, so the record cannot race another driver.
+        if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
+            tracing::debug!(
+                "gc: could not record {}: {e:#}",
+                crate::report::GC_STATS_FILE
+            );
         }
 
         Ok(GcRunReport {
@@ -10169,6 +10187,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -11754,6 +11773,40 @@ mod tests {
             !store.contains("upload_evict_key"),
             "eviction should run once gc.lock is available"
         );
+    }
+
+    /// Upload-triggered eviction is a GC driver too: without a record, the
+    /// evictions it makes (and the ones it fails) never reach gc_stats.json.
+    #[test]
+    fn upload_triggered_eviction_records_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+
+        let src_file = dir.path().join("big.rlib");
+        std::fs::write(&src_file, vec![0u8; 200]).unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "upload_evict_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
+        store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
+
+        Daemon::new(config).maybe_evict_after_upload();
+
+        let recorded = crate::report::read_gc_stats(dir.path()).expect("gc_stats.json written");
+        assert_eq!(recorded.source, "daemon");
+        assert_eq!(recorded.entries_evicted, 1);
     }
 
     #[test]

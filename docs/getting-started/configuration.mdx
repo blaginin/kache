@@ -114,7 +114,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
-| `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `false` | Remember the source closure each crate's dep-info pass discovers |
+| `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `false` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
 | none | `cache.bypass_crates` | `[]` | Exact rustc crate names that bypass Kache |
@@ -252,6 +252,26 @@ kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
 
 That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenario` must match `kache.bench.project`. `--phase` distinguishes cold from warm: the bench stops the daemon between phases, so counters are per daemon lifetime. The rustc wrapper does not write these files. The planner service still exposes Prometheus `/metrics` for cluster scrape.
 
+### Machine telemetry
+
+On a host where several jobs share one cache, such as a CI machine with several runner slots, the same payload also describes the machine's shared cache: `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size` (the `-wal` alone; one that stays large means checkpoints are not keeping up), `kache.cache.index.rowid_high_water` per table, and the last GC run as gauges (`kache.cache.gc.last_run.*`: when it ran, entries evicted, bytes freed, evictions that failed and those that lost the index write lock, duration, and time spent in eviction writes). The payload has no host attribute; whatever ships the file adds host identity. These figures never wait: the index is read `query_only` with a 25 ms busy timeout, and a figure it cannot answer at once is left out. `kache stats` shows the same figures, and `kache stats --json` carries them as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
+
+Read `rowid_high_water` as a write counter, not a row count. It is the largest rowid in each table. Several tables (`file_hashes`, `cc_preprocess_memos`, `input_predictions`, `eviction_tombstones`) are written with `INSERT OR REPLACE`, which gives a replaced row a new rowid, so the figure grows with every insert and every replacement and does not fall when rows are deleted. For how big the index is, use `kache.cache.index.size`.
+
+To keep per-build numbers at machine level, add `--record` to `kache report`:
+
+```bash
+kache report --format github --since 24h --record
+```
+
+After rendering the report as usual, it appends one JSON line to `telemetry/sessions.jsonl` in the cache dir: the report's summary and timing breakdown (hit overhead, key, dep-info pre-pass, restore, wait, prediction mismatches), plus load average, CPUs and index size at that moment. Use it at the end of a CI job: the report reads the runtime dir, which the job's cleanup deletes. The root is recorded as a hash, never as a path.
+
+To record every report on a host without passing the flag, set `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true`. It is off by default, and with neither setting nor `--record`, `kache report` writes nothing.
+
+Every GC driver (the daemon's sweep and its eviction after an upload, the auto-GC worker, and `kache gc` run locally, `--stale-schema` and `--max-age` included) records its run in `gc_stats.json` in the cache dir, including evictions that failed and how many of those lost the index write lock to running builds. With `record_sessions` on, each run also appends one line to `telemetry/gc-runs.jsonl` in the cache dir (time, driver, entries evicted, bytes freed, failed and lock-contended evictions, pinned and unreclaimable entries, duration, and time spent in eviction writes), rotated like the other logs. `gc_stats.json` keeps only the latest run; the history is what a backend adds up.
+
+Session and GC history are opt-in. The machine figures are computed only by `kache telemetry write` and `kache stats`, and both only read: file sizes, `gc_stats.json`, and one seek per table for its row mark, never a count over a table. Nothing is sent over the network. `telemetry/sessions.jsonl` exists only after a `kache report --record` or with `record_sessions` on, and `telemetry/gc-runs.jsonl` only with `record_sessions` on. The one change that is always on is GC accounting: the auto-GC worker and `kache gc` now update the same `gc_stats.json` the daemon already wrote, once per GC run.
+
 ## Daemon, events, and diagnostics
 
 | Environment | TOML key | Default | Purpose |
@@ -260,6 +280,7 @@ That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenar
 | `KACHE_LOCAL_HIT_DAEMON` | `cache.local_hit_daemon` | `false` | Experimental daemon-assisted local lookup with local fallback |
 | `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | Event heartbeat cadence for long miss compiles; `0` disables it |
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Record changed key groups on repeat misses |
+| `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache report` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |

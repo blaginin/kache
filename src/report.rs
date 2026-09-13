@@ -11,8 +11,9 @@ use crate::since::SinceWindow;
 
 // ── Data Model ──────────────────────────────────────────────────────────────
 
-/// Persisted GC stats written by the daemon to gc_stats.json.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `gc_stats.json`: the last GC run, whichever driver ran it. Files written
+/// by earlier versions can carry a `totals` object, which is ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcStatsPersisted {
     pub last_run: String,
     pub entries_evicted: usize,
@@ -21,6 +22,196 @@ pub struct GcStatsPersisted {
     pub disk_bytes_reclaimed: u64,
     pub blobs_removed: usize,
     pub duration_ms: u64,
+    /// `daemon` (its sweep, or `kache gc` routed through it), `auto` (the
+    /// detached worker a wrapper spawns when the store outgrows its limit) or
+    /// `manual` (`kache gc` with no daemon). Empty in files written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default)]
+    pub entries_pinned: usize,
+    #[serde(default)]
+    pub entries_failed: usize,
+    #[serde(default)]
+    pub entries_locked: usize,
+    /// Time the run spent in its eviction writes, busy waits included.
+    #[serde(default)]
+    pub evict_write_ms: u64,
+}
+
+pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
+
+/// Read `cache_dir/gc_stats.json`, or `None` when it is absent. A file that
+/// does not parse also reads as `None`, with a warning, so a damaged record
+/// does not pass silently.
+pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
+    let path = cache_dir.join(GC_STATS_FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&content) {
+        Ok(stats) => Some(stats),
+        Err(e) => {
+            tracing::warn!(
+                "{} does not parse ({e}); the next GC run replaces it",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Schema of one line in `cache_dir/telemetry/gc-runs.jsonl`.
+pub const GC_RUN_RECORD_SCHEMA: u32 = 1;
+
+/// One GC run in `telemetry/gc-runs.jsonl`, written only with session
+/// recording on. `gc_stats.json` keeps the latest run; this history is what
+/// a backend adds up across runs and drivers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GcRunRecord {
+    pub ts: String,
+    pub schema: u32,
+    /// `daemon`, `auto` or `manual`, as in `gc_stats.json`.
+    pub source: String,
+    pub entries_evicted: usize,
+    pub bytes_freed: u64,
+    pub disk_bytes_reclaimed: u64,
+    pub blobs_removed: usize,
+    pub entries_failed: usize,
+    /// The failed evictions that lost the index write lock.
+    pub entries_locked: usize,
+    pub entries_pinned: usize,
+    pub entries_unreclaimable: usize,
+    pub duration_ms: u64,
+    /// Time spent in eviction writes, busy waits included.
+    #[serde(default)]
+    pub evict_write_ms: u64,
+}
+
+impl GcRunRecord {
+    fn new(source: &str, stats: &crate::store::GcStats) -> Self {
+        Self {
+            ts: Utc::now().to_rfc3339(),
+            schema: GC_RUN_RECORD_SCHEMA,
+            source: source.to_string(),
+            entries_evicted: stats.entries_evicted,
+            bytes_freed: stats.bytes_freed,
+            disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
+            blobs_removed: stats.blobs_removed,
+            entries_failed: stats.entries_failed,
+            entries_locked: stats.entries_locked,
+            entries_pinned: stats.entries_pinned,
+            entries_unreclaimable: stats.entries_unreclaimable,
+            duration_ms: stats.duration_ms,
+            evict_write_ms: stats.evict_write_ms,
+        }
+    }
+}
+
+/// The machine-level GC history, beside `sessions.jsonl` in the cache dir.
+pub(crate) fn gc_runs_log_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("telemetry").join("gc-runs.jsonl")
+}
+
+/// Record one finished GC run: `gc_stats.json` always, and one line in
+/// `telemetry/gc-runs.jsonl` when session recording is on, rotated like the
+/// other logs. Callers hold `gc.lock`.
+pub fn record_gc_run(config: &Config, source: &str, stats: &crate::store::GcStats) -> Result<()> {
+    write_last_gc_run(&config.cache_dir, source, stats)?;
+    if !config.record_sessions {
+        return Ok(());
+    }
+    let path = gc_runs_log_path(&config.cache_dir);
+    crate::events::append_json_line(&path, &GcRunRecord::new(source, stats))?;
+    crate::events::rotate_if_needed(
+        &path,
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    )
+}
+
+/// Replace `gc_stats.json` with this run.
+pub(crate) fn write_last_gc_run(
+    cache_dir: &Path,
+    source: &str,
+    stats: &crate::store::GcStats,
+) -> Result<()> {
+    let persisted = GcStatsPersisted {
+        last_run: Utc::now().to_rfc3339(),
+        entries_evicted: stats.entries_evicted,
+        bytes_freed: stats.bytes_freed,
+        disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
+        blobs_removed: stats.blobs_removed,
+        duration_ms: stats.duration_ms,
+        source: source.to_string(),
+        entries_pinned: stats.entries_pinned,
+        entries_failed: stats.entries_failed,
+        entries_locked: stats.entries_locked,
+        evict_write_ms: stats.evict_write_ms,
+    };
+    let json = serde_json::to_string_pretty(&persisted)?;
+    kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
+}
+
+/// Schema of one line in `cache_dir/telemetry/sessions.jsonl`.
+pub const SESSION_RECORD_SCHEMA: u32 = 1;
+
+/// One build session's report, kept at machine level. `kache report` reads
+/// events from the runtime dir, which CI deletes with the job; this line is
+/// what survives, in the cache dir every job on the host shares.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub ts: String,
+    pub schema: u32,
+    pub kache_version: String,
+    /// The report window as its heading shows it: `24h`, `build session`.
+    pub window: String,
+    /// First 16 hex digits of blake3(root), never the path itself: enough to
+    /// tell builds of one tree apart across jobs without recording where the
+    /// tree lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    pub summary: ReportSummary,
+    pub timing: TimingBreakdown,
+    pub machine: SessionMachine,
+}
+
+/// The host when the session was recorded: the context that separates a slow
+/// cache from a busy machine.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SessionMachine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_1m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_bytes: Option<u64>,
+    pub store_max: u64,
+}
+
+impl SessionRecord {
+    pub fn from_report(report: &BuildReport, machine: SessionMachine) -> Self {
+        let meta = &report.meta;
+        let window = meta.window_label();
+        let (root, session_id) = match &meta.session {
+            Some(session) => (Some(session.root.clone()), session.session_id.clone()),
+            None => (meta.root_filter.clone(), String::new()),
+        };
+        let root_hash = root
+            .filter(|root| !root.is_empty())
+            .map(|root| blake3::hash(root.as_bytes()).to_hex().as_str()[..16].to_string());
+        Self {
+            ts: Utc::now().to_rfc3339(),
+            schema: SESSION_RECORD_SCHEMA,
+            kache_version: meta.kache_version.clone(),
+            window,
+            root_hash,
+            session_id,
+            summary: report.summary.clone(),
+            timing: report.timing.clone(),
+            machine,
+        }
+    }
 }
 
 /// GC summary included in build reports when GC ran recently.
@@ -137,7 +328,7 @@ fn default_trace_display_time_unit() -> String {
     "ms".to_string()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportSummary {
     pub hit_rate_pct: f64,
     pub weighted_hit_rate_pct: Option<f64>,
@@ -198,7 +389,7 @@ pub struct ReportTimeline {
     pub error_count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimingBreakdown {
     pub hit_time_ms: u64,
     pub miss_time_ms: u64,
@@ -3688,6 +3879,214 @@ mod tests {
         assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
     }
 
+    /// The GC history is opt-in with session recording. Off, a run writes
+    /// gc_stats.json and nothing under `telemetry/`; on, each run appends one
+    /// line carrying every figure of that run.
+    #[test]
+    fn gc_runs_history_is_appended_only_with_record_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = write_test_events(dir.path());
+        let run = crate::store::GcStats {
+            entries_evicted: 3,
+            bytes_freed: 100,
+            disk_bytes_reclaimed: 60,
+            blobs_removed: 2,
+            duration_ms: 9,
+            entries_pinned: 4,
+            entries_unreclaimable: 1,
+            entries_failed: 5,
+            entries_locked: 3,
+            evict_write_ms: 11,
+            ..Default::default()
+        };
+
+        record_gc_run(&config, "daemon", &run).unwrap();
+        assert_eq!(read_gc_stats(&config.cache_dir).unwrap().source, "daemon");
+        assert!(
+            !config.cache_dir.join("telemetry").exists(),
+            "recording off: no telemetry dir"
+        );
+
+        config.record_sessions = true;
+        record_gc_run(&config, "auto", &run).unwrap();
+        record_gc_run(&config, "manual", &crate::store::GcStats::default()).unwrap();
+
+        let log = std::fs::read_to_string(gc_runs_log_path(&config.cache_dir)).unwrap();
+        let records: Vec<GcRunRecord> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "{log}");
+        assert!(chrono::DateTime::parse_from_rfc3339(&records[0].ts).is_ok());
+        assert_eq!(
+            records[0],
+            GcRunRecord {
+                ts: records[0].ts.clone(),
+                schema: 1,
+                source: "auto".to_string(),
+                entries_evicted: 3,
+                bytes_freed: 100,
+                disk_bytes_reclaimed: 60,
+                blobs_removed: 2,
+                entries_failed: 5,
+                entries_locked: 3,
+                entries_pinned: 4,
+                entries_unreclaimable: 1,
+                duration_ms: 9,
+                evict_write_ms: 11,
+            }
+        );
+        assert_eq!(records[1].source, "manual");
+        assert_eq!(records[1].entries_evicted, 0);
+    }
+
+    #[test]
+    fn gc_runs_history_rotates_like_the_other_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = write_test_events(dir.path());
+        config.record_sessions = true;
+        config.event_log_max_size = 1;
+        config.event_log_keep_lines = 2;
+        for entries_evicted in 1..=3 {
+            let run = crate::store::GcStats {
+                entries_evicted,
+                ..Default::default()
+            };
+            record_gc_run(&config, "manual", &run).unwrap();
+        }
+        let log = std::fs::read_to_string(gc_runs_log_path(&config.cache_dir)).unwrap();
+        let evicted: Vec<usize> = log
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<GcRunRecord>(line)
+                    .unwrap()
+                    .entries_evicted
+            })
+            .collect();
+        // Past the size cap, rotation keeps at most keep_lines, then drops the
+        // oldest until the file fits; a 1-byte cap leaves only the newest.
+        assert_eq!(evicted, vec![3]);
+    }
+
+    /// gc_stats.json is the last run only: a second run replaces every field,
+    /// and the file keeps the keys that older readers require.
+    #[test]
+    fn record_gc_run_keeps_only_the_last_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = crate::store::GcStats {
+            entries_evicted: 3,
+            bytes_freed: 100,
+            entries_failed: 2,
+            entries_locked: 2,
+            ..Default::default()
+        };
+        let second = crate::store::GcStats {
+            entries_evicted: 1,
+            bytes_freed: 50,
+            disk_bytes_reclaimed: 40,
+            blobs_removed: 4,
+            duration_ms: 7,
+            entries_pinned: 6,
+            entries_failed: 5,
+            entries_locked: 4,
+            evict_write_ms: 12,
+            ..Default::default()
+        };
+        write_last_gc_run(dir.path(), "daemon", &first).unwrap();
+        write_last_gc_run(dir.path(), "auto", &second).unwrap();
+
+        let stats = read_gc_stats(dir.path()).unwrap();
+        assert_eq!(
+            (
+                stats.source.as_str(),
+                stats.entries_evicted,
+                stats.bytes_freed,
+                stats.disk_bytes_reclaimed,
+                stats.blobs_removed,
+                stats.duration_ms,
+                stats.entries_pinned,
+                stats.entries_failed,
+                stats.entries_locked,
+            ),
+            ("auto", 1, 50, 40, 4, 7, 6, 5, 4)
+        );
+        assert_eq!(stats.evict_write_ms, 12);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap())
+                .unwrap();
+        assert!(raw.get("totals").is_none(), "{raw}");
+        for key in [
+            "last_run",
+            "entries_evicted",
+            "bytes_freed",
+            "blobs_removed",
+            "duration_ms",
+        ] {
+            assert!(raw.get(key).is_some(), "older readers require {key}: {raw}");
+        }
+    }
+
+    /// A gc_stats.json that no longer parses is replaced by the next GC run.
+    /// That has to show in the log rather than pass silently.
+    #[test]
+    fn unparseable_gc_stats_warns_before_it_is_replaced() {
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(GC_STATS_FILE), b"{\"totals\": ").unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = std::sync::Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(std::sync::Arc::clone(&writer)))
+            .finish();
+
+        let read = tracing::subscriber::with_default(subscriber, || read_gc_stats(dir.path()));
+
+        assert!(read.is_none());
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("the next GC run replaces it"), "{log}");
+    }
+
+    /// Files written while gc_stats.json carried running totals still load,
+    /// and the next run writes the last-run record without them.
+    #[test]
+    fn gc_stats_with_totals_from_an_earlier_version_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(GC_STATS_FILE),
+            r#"{"last_run":"2026-09-12T12:11:05+00:00","entries_evicted":2,"bytes_freed":9,"blobs_removed":1,"duration_ms":3,"source":"auto","totals":{"since":"2026-09-01T00:00:00+00:00","runs":4}}"#,
+        )
+        .unwrap();
+        let old = read_gc_stats(dir.path()).expect("the earlier format parses");
+        assert_eq!(
+            (old.entries_evicted, old.bytes_freed, old.source.as_str()),
+            (2, 9, "auto")
+        );
+
+        let run = crate::store::GcStats {
+            entries_evicted: 5,
+            ..Default::default()
+        };
+        write_last_gc_run(dir.path(), "manual", &run).unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap();
+        assert!(!raw.contains("totals"), "{raw}");
+        let gc = load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now()))
+            .expect("the recorded run is inside the window");
+        assert_eq!(gc.entries_evicted, 5);
+    }
+
     fn test_event(
         crate_name: &str,
         result: EventResult,
@@ -3820,6 +4219,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5111,6 +5511,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5177,6 +5578,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5253,6 +5655,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5330,6 +5733,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5412,6 +5816,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5822,6 +6227,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -6164,6 +6570,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,

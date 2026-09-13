@@ -313,12 +313,20 @@ pub struct Config {
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
     /// Opt-in input-set predictions: when on, each rustc invocation remembers
-    /// the source closure its dep-info pre-pass discovered, so a later build of
-    /// the same unit can derive the key without spawning the pre-pass again.
-    /// Recording only for now — nothing reads a record back yet. Off by
-    /// default. Set via `KACHE_INPUT_PREDICTIONS=1`/`=true` or
-    /// `[cache] input_predictions`; env wins over the file.
+    /// the source closure its dep-info pre-pass discovered, and a later build
+    /// of the same unit derives the key from that record instead of spawning
+    /// the pre-pass (kunobi-ninja/kache#939). Every path and env value in the
+    /// record is re-validated first, and any doubt runs the pre-pass;
+    /// `KACHE_VERIFY_INPUT_PREDICTIONS=sampled|always` cross-checks records
+    /// against it and counts disagreements. Off by default until
+    /// kunobi-ninja/kache#1000 decides. Set via `KACHE_INPUT_PREDICTIONS=1`/
+    /// `=true` or `[cache] input_predictions`; env wins over the file.
     pub input_predictions: bool,
+    /// Make every `kache report` append its session line to
+    /// `<cache dir>/telemetry/sessions.jsonl`, as `--record` does, and every
+    /// GC run append one line to `telemetry/gc-runs.jsonl`. Off by default. Set via `KACHE_RECORD_SESSIONS=1`/`=true` or `[cache]
+    /// record_sessions`; env wins over the file.
+    pub record_sessions: bool,
     /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when
     /// on, a primary rustc invocation skips opening the local SQLite store and
     /// asks the running daemon to perform the lookup, restoring from the blob
@@ -641,6 +649,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) modified_input_guard: Option<bool>,
     /// Input-set predictions. See [`Config::input_predictions`].
     pub(crate) input_predictions: Option<bool>,
+    /// Session recording. See [`Config::record_sessions`].
+    pub(crate) record_sessions: Option<bool>,
     /// Daemon-assisted local hits. See [`Config::local_hit_daemon`].
     pub(crate) local_hit_daemon: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
@@ -1021,6 +1031,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
     "KACHE_INPUT_PREDICTIONS",
+    "KACHE_RECORD_SESSIONS",
     "KACHE_LOCAL_HIT_DAEMON",
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_AUTO_GC",
@@ -1094,6 +1105,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_REMOTE_READONLY", "cache.remote_readonly"),
     ("KACHE_MODIFIED_INPUT_GUARD", "cache.modified_input_guard"),
     ("KACHE_INPUT_PREDICTIONS", "cache.input_predictions"),
+    ("KACHE_RECORD_SESSIONS", "cache.record_sessions"),
     ("KACHE_LOCAL_HIT_DAEMON", "cache.local_hit_daemon"),
     ("KACHE_WINDOWS_HARDLINK", "cache.windows_hardlink"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
@@ -1571,6 +1583,7 @@ impl Config {
         }
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let input_predictions = Self::input_predictions_enabled(&file_config);
+        let record_sessions = Self::record_sessions_enabled(&file_config);
         let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
@@ -1624,6 +1637,7 @@ impl Config {
             remote_readonly,
             modified_input_guard,
             input_predictions,
+            record_sessions,
             local_hit_daemon,
             windows_hardlink,
             auto_gc,
@@ -2017,6 +2031,22 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.input_predictions)
+            .unwrap_or(false)
+    }
+
+    /// Whether every `kache report` records its session. Env wins over the
+    /// file: `KACHE_RECORD_SESSIONS=1`/`=true`, else `[cache] record_sessions`,
+    /// else off.
+    fn record_sessions_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_RECORD_SESSIONS", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.record_sessions)
             .unwrap_or(false)
     }
 
@@ -3419,6 +3449,44 @@ pub(crate) mod tests {
         }
     }
 
+    /// Session recording resolves like input predictions: the environment
+    /// over the file, and off with neither.
+    #[test]
+    fn record_sessions_resolve_env_over_file_and_default_off() {
+        let file_says = |value: Option<bool>| -> Result<FileConfig> {
+            Ok(FileConfig {
+                cache: Some(CacheFileConfig {
+                    record_sessions: value,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+
+        {
+            let _env = set_env_for_test("KACHE_RECORD_SESSIONS", None);
+            assert!(
+                !Config::record_sessions_enabled(&file_says(None)),
+                "off unless something asks for it"
+            );
+            assert!(Config::record_sessions_enabled(&file_says(Some(true))));
+        }
+        for on in ["1", "true", "TRUE"] {
+            let _env = set_env_for_test("KACHE_RECORD_SESSIONS", Some(on.as_ref()));
+            assert!(
+                Config::record_sessions_enabled(&file_says(Some(false))),
+                "{on} in the environment must override the file"
+            );
+        }
+        for off in ["0", "false", ""] {
+            let _env = set_env_for_test("KACHE_RECORD_SESSIONS", Some(off.as_ref()));
+            assert!(
+                !Config::record_sessions_enabled(&file_says(Some(true))),
+                "{off:?} in the environment must override the file"
+            );
+        }
+    }
+
     fn set_kache_config_for_test(path: &std::path::Path) -> TestEnvGuard {
         set_env_for_test("KACHE_CONFIG", Some(path.as_os_str()))
     }
@@ -4178,6 +4246,32 @@ remote_key_cache_refresh_secs = 900
         let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(std::ffi::OsStr::new("0")));
         assert!(
             !Config::input_predictions_enabled(&file),
+            "the environment overrides the host file"
+        );
+    }
+
+    /// A CI host turns session recording on once, in the host layer, under a
+    /// kache-action `KACHE_CONFIG` that only names the remote.
+    #[test]
+    fn record_sessions_comes_from_the_host_layer() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\nrecord_sessions = true\n",
+            Some("[cache.remote]\ntype = \"s3\"\nbucket = \"ci\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let file = Config::load_file_config();
+
+        {
+            let _env = set_env_for_test("KACHE_RECORD_SESSIONS", None);
+            assert!(Config::record_sessions_enabled(&file), "host value");
+        }
+        let _env = set_env_for_test("KACHE_RECORD_SESSIONS", Some(std::ffi::OsStr::new("0")));
+        assert!(
+            !Config::record_sessions_enabled(&file),
             "the environment overrides the host file"
         );
     }
@@ -4950,6 +5044,7 @@ remote_key_cache_refresh_secs = 900
                 volumes: None,
                 modified_input_guard: None,
                 input_predictions: None,
+                record_sessions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
@@ -5416,6 +5511,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5473,6 +5569,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5526,6 +5623,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -5598,6 +5696,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
@@ -6256,6 +6355,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 volumes: None,
                 modified_input_guard: None,
                 input_predictions: None,
+                record_sessions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,

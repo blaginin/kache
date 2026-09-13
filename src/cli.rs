@@ -354,6 +354,107 @@ pub(crate) fn snapshot_from_direct_reads(
     }
 }
 
+/// Index tables whose size explains a store: the entry and blob maps that grow
+/// with the cache, and the key-side caches and tombstones beside them.
+const MACHINE_INDEX_TABLES: [&str; 7] = [
+    "entries",
+    "blobs",
+    "entry_blobs",
+    "file_hashes",
+    "cc_preprocess_memos",
+    "input_predictions",
+    "eviction_tombstones",
+];
+
+/// Read the shared cache without getting in a build's way: a read-only
+/// connection (`query_only`, 25 ms busy timeout), no schema work and no
+/// daemon, so a figure the index is too busy to answer is left out rather
+/// than waited for. Read-only also means closing the connection can never
+/// checkpoint the WAL into `index.db`.
+pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot {
+    let db_path = config.index_db_path();
+    let index_bytes = index_file_bytes(config);
+    let mut snap = crate::otel::MachineSnapshot {
+        index_bytes,
+        wal_bytes: index_wal_bytes(config),
+        gc: crate::report::read_gc_stats(&config.cache_dir),
+        ..Default::default()
+    };
+    if index_bytes.is_none() {
+        return snap;
+    }
+    let Ok(db) = crate::store::open_index_db_readonly(&db_path) else {
+        return snap;
+    };
+    for table in MACHINE_INDEX_TABLES {
+        let top: rusqlite::Result<Option<i64>> =
+            db.query_row(&rowid_high_water_sql(table), [], |row| row.get(0));
+        if let Ok(top) = top {
+            snap.rowid_high_water
+                .push((table, top.unwrap_or(0).max(0) as u64));
+        }
+    }
+    snap
+}
+
+/// A table's rowid high-water mark: one seek to the last leaf of its b-tree,
+/// where `COUNT(*)` would read every page of a table that can hold gigabytes.
+fn rowid_high_water_sql(table: &str) -> String {
+    format!("SELECT MAX(rowid) FROM {table}")
+}
+
+/// `index.db` plus its `-wal`, or `None` when there is no index yet.
+fn index_file_bytes(config: &Config) -> Option<u64> {
+    let db_path = config.index_db_path();
+    let mut wal = db_path.clone().into_os_string();
+    wal.push("-wal");
+    std::fs::metadata(&db_path)
+        .ok()
+        .map(|db| db.len() + std::fs::metadata(&wal).map(|w| w.len()).unwrap_or(0))
+}
+
+/// The index's `-wal` file alone: 0 when it is absent, `None` when there is
+/// no index. A WAL that stays large means checkpoints are not keeping up
+/// with the writes.
+fn index_wal_bytes(config: &Config) -> Option<u64> {
+    let db_path = config.index_db_path();
+    std::fs::metadata(&db_path).ok()?;
+    let mut wal = db_path.into_os_string();
+    wal.push("-wal");
+    Some(std::fs::metadata(&wal).map(|w| w.len()).unwrap_or(0))
+}
+
+/// The machine-level session log. In the cache dir, which every job on the
+/// host shares, not the runtime dir a CI job deletes when it ends.
+pub(crate) fn session_log_path(config: &Config) -> std::path::PathBuf {
+    config.cache_dir.join("telemetry").join("sessions.jsonl")
+}
+
+/// Append `report` to the machine-level session log (`kache report
+/// --record`): its summary and timing breakdown, plus what the host looked
+/// like at that moment. Meant for the end of a CI job, before its runtime dir
+/// and the events in it are deleted.
+pub(crate) fn record_session(config: &Config, report: &crate::report::BuildReport) -> Result<()> {
+    let mut loads = [0.0; 3];
+    let written = crate::otel::sample_load_averages(&mut loads);
+    let machine = crate::report::SessionMachine {
+        load_1m: crate::otel::one_minute_load(written, loads[0]),
+        cpus: std::thread::available_parallelism()
+            .ok()
+            .and_then(|n| u32::try_from(n.get()).ok()),
+        index_bytes: index_file_bytes(config),
+        store_max: config.max_size,
+    };
+    let record = crate::report::SessionRecord::from_report(report, machine);
+    let path = session_log_path(config);
+    crate::events::append_json_line(&path, &record)?;
+    crate::events::rotate_if_needed(
+        &path,
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    )
+}
+
 /// Write cache counters as OTLP JSON for Kartero (`metrics.otlp.json` +
 /// `schema_version`). Uses the running daemon when reachable; otherwise the
 /// local store. Does not auto-start a daemon, so a finished bench dumps what
@@ -409,6 +510,7 @@ pub fn telemetry_write(
     crate::otel::write_otlp(
         dir,
         &otel_snapshot_from_stats(config, &snap),
+        &machine_snapshot(config),
         crate::VERSION,
         scenario,
         phase,
@@ -503,11 +605,26 @@ pub fn stats(
         .unwrap_or(snap.total_size);
     let disk = crate::machine::disk_view(&config.store_dir(), store_bytes, snap.max_size);
     let host_config = host_config_in_effect(&crate::config::host_config_status());
+    let machine = machine_snapshot(config);
 
     if json {
         #[derive(serde::Serialize)]
         struct Body<'a> {
             disk: crate::machine::DiskView,
+            /// This machine's shared index (`index.db` plus `-wal`) and each
+            /// table's largest rowid, as `kache telemetry write` reports them.
+            /// The rowid grows with every insert and replacement; it is not
+            /// a row count.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            index_bytes: Option<u64>,
+            /// The `-wal` file alone, also counted in `index_bytes`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            index_wal_bytes: Option<u64>,
+            #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+            index_rowid_high_water: std::collections::BTreeMap<&'static str, u64>,
+            /// The last GC run, from `gc_stats.json`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            gc: Option<crate::report::GcStatsPersisted>,
             entries: usize,
             hit_rate_pct: f64,
             local_hits: usize,
@@ -535,6 +652,10 @@ pub fn stats(
             "stats",
             Body {
                 disk: disk.clone(),
+                index_bytes: machine.index_bytes,
+                index_wal_bytes: machine.wal_bytes,
+                index_rowid_high_water: machine.rowid_high_water.iter().copied().collect(),
+                gc: machine.gc.clone(),
                 entries: snap.entry_count,
                 hit_rate_pct: hit_rate,
                 local_hits: snap.event_stats.local_hits,
@@ -560,6 +681,9 @@ pub fn stats(
         println!("Host config: {path}");
     }
     if let Some(line) = cloned_targets_line(&disk) {
+        println!("{line}");
+    }
+    for line in machine_lines(&machine) {
         println!("{line}");
     }
 
@@ -592,6 +716,57 @@ pub fn stats(
         }
     }
     Ok(())
+}
+
+/// `kache stats` lines for the machine's shared index and GC record: what the
+/// cache costs the host beyond its artifacts, and whether GC keeps up. Pure,
+/// like [`render_stats`].
+fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(bytes) = machine.index_bytes {
+        let mut rows = machine.rowid_high_water.clone();
+        rows.sort_by_key(|&(_, rows)| std::cmp::Reverse(rows));
+        let top: Vec<String> = rows
+            .iter()
+            .take(3)
+            .map(|(table, rows)| format!("{table} {rows}"))
+            .collect();
+        let wal = machine
+            .wal_bytes
+            .map(|wal| format!(", WAL {}", ByteSize(wal)))
+            .unwrap_or_default();
+        if top.is_empty() {
+            lines.push(format!("Index:     {}{wal}", ByteSize(bytes)));
+        } else {
+            lines.push(format!(
+                "Index:     {}{wal} (rowid high-water: {})",
+                ByteSize(bytes),
+                top.join(", ")
+            ));
+        }
+    }
+    if let Some(gc) = &machine.gc {
+        let source = if gc.source.is_empty() {
+            "daemon"
+        } else {
+            gc.source.as_str()
+        };
+        let mut line = format!(
+            "GC:        last run {} ({source}): {} evicted",
+            gc.last_run, gc.entries_evicted
+        );
+        if gc.entries_failed > 0 {
+            line.push_str(&format!(
+                ", {} failed ({} lost the index write lock)",
+                gc.entries_failed, gc.entries_locked
+            ));
+        }
+        if gc.evict_write_ms > 0 {
+            line.push_str(&format!(", {} ms in index writes", gc.evict_write_ms));
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 /// Render the `kache stats` summary lines from a fetched snapshot. Pure (no I/O)
@@ -1018,6 +1193,7 @@ pub fn report(
     filter: crate::report::ReportFilter,
     output: Option<std::path::PathBuf>,
     top: usize,
+    record: bool,
 ) -> Result<()> {
     let report = if filter.root.is_some() || filter.last_build {
         crate::report::generate_report_with_filter(config, window, top, &filter)?
@@ -1039,6 +1215,18 @@ pub fn report(
         eprintln!("Report written to {}", path.display());
     } else {
         println!("{text}");
+    }
+
+    // The session line is a side effect of the report: a cache dir it cannot
+    // write costs that line and a warning, never the report or the exit code.
+    // `record_sessions` records every report as `--record` does.
+    let recorded = if record || config.record_sessions {
+        record_session(config, &report)
+    } else {
+        Ok(())
+    };
+    if let Err(e) = recorded {
+        eprintln!("warning: this session was not recorded: {e:#}");
     }
 
     Ok(())
@@ -2813,6 +3001,21 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
+    // Still under gc.lock, so the record cannot race another driver.
+    // The auto-GC worker used to discard this outcome entirely. A failed write
+    // must not fail the sweep it describes.
+    let source = if mode == GcMode::Background {
+        "auto"
+    } else {
+        "manual"
+    };
+    if let Err(e) = crate::report::record_gc_run(config, source, &combined) {
+        tracing::debug!(
+            "gc: could not record {}: {e:#}",
+            crate::report::GC_STATS_FILE
+        );
+    }
+
     Ok(combined)
 }
 
@@ -2835,6 +3038,9 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     total.disk_bytes_reclaimed = total
         .disk_bytes_reclaimed
         .saturating_add(part.disk_bytes_reclaimed);
+    total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
+    total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
+    total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
     total.skipped |= part.skipped;
 }
 
@@ -2850,6 +3056,9 @@ fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store:
         total.entries_unreclaimable = total
             .entries_unreclaimable
             .saturating_add(part.entries_unreclaimable);
+        total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
+        total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
+        total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
     }
     total
 }
@@ -2895,6 +3104,26 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
     )
 }
 
+/// Record a GC run `kache gc` made itself. A failed write costs the record,
+/// never the GC.
+fn record_manual_gc_run(config: &Config, stats: &crate::store::GcStats) {
+    if let Err(e) = crate::report::record_gc_run(config, "manual", stats) {
+        tracing::warn!("recording GC run: {e:#}");
+    }
+}
+
+/// `kache gc --max-age` run locally because the daemon could not take it. The
+/// caller holds gc.lock, so the recorded totals cannot race another driver.
+fn evict_older_than_recorded(
+    store: &Store,
+    config: &Config,
+    hours: u64,
+) -> Result<crate::store::GcStats> {
+    let stats = store.evict_older_than(hours)?;
+    record_manual_gc_run(config, &stats);
+    Ok(stats)
+}
+
 /// Run garbage collection via the daemon.
 pub fn gc(
     config: &Config,
@@ -2915,6 +3144,7 @@ pub fn gc(
             }
         };
         let stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        record_manual_gc_run(config, &stats);
         if json {
             return emit_gc_json(config, false, &stats);
         }
@@ -3004,7 +3234,7 @@ pub fn gc(
                     print!("Running eviction...");
                     std::io::Write::flush(&mut std::io::stdout()).ok();
                 }
-                let evict_stats = store.evict_older_than(hours)?;
+                let evict_stats = evict_older_than_recorded(&store, config, hours)?;
                 combined = evict_stats.clone();
                 if human_gc_output(json) {
                     let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
@@ -6793,6 +7023,9 @@ mod tests {
                 entries_pinned: (n * 100) as usize,
                 disk_bytes_reclaimed: n * 1_000,
                 entries_unreclaimable: (n * 10_000) as usize,
+                entries_failed: (n * 100_000) as usize,
+                entries_locked: (n * 1_000_000) as usize,
+                evict_write_ms: n * 10_000_000,
             }
         }
         let report = crate::daemon::GcBreakdown {
@@ -6807,6 +7040,9 @@ mod tests {
         assert_eq!(total.entries_pinned, 600);
         assert_eq!(total.disk_bytes_reclaimed, 6_000);
         assert_eq!(total.entries_unreclaimable, 60_000);
+        assert_eq!(total.entries_failed, 600_000);
+        assert_eq!(total.entries_locked, 6_000_000);
+        assert_eq!(total.evict_write_ms, 60_000_000);
 
         let mut accumulated = crate::store::GcStats {
             entries_evicted: 1,
@@ -6817,6 +7053,9 @@ mod tests {
             entries_unreclaimable: 5,
             disk_bytes_reclaimed: 6,
             skipped: false,
+            entries_failed: 8,
+            entries_locked: 9,
+            evict_write_ms: 11,
         };
         let part = crate::store::GcStats {
             entries_evicted: 10,
@@ -6827,6 +7066,9 @@ mod tests {
             entries_unreclaimable: 50,
             disk_bytes_reclaimed: 60,
             skipped: true,
+            entries_failed: 80,
+            entries_locked: 90,
+            evict_write_ms: 110,
         };
         add_gc_stats(&mut accumulated, &part);
         assert_eq!(accumulated.entries_evicted, 11);
@@ -6836,7 +7078,468 @@ mod tests {
         assert_eq!(accumulated.duration_ms, 77);
         assert_eq!(accumulated.entries_unreclaimable, 55);
         assert_eq!(accumulated.disk_bytes_reclaimed, 66);
+        assert_eq!(accumulated.entries_failed, 88);
+        assert_eq!(accumulated.entries_locked, 99);
+        assert_eq!(accumulated.evict_write_ms, 121);
         assert!(accumulated.skipped);
+    }
+
+    /// The auto-GC worker used to throw its outcome away, so a machine where
+    /// only the worker ever ran GC had no `gc_stats.json` at all.
+    #[test]
+    fn local_gc_records_its_run_with_the_driver_that_ran_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        run_gc_local(&config, GcMode::Background).unwrap();
+        let stats = crate::report::read_gc_stats(&config.cache_dir).expect("worker run recorded");
+        assert_eq!(stats.source, "auto");
+
+        run_gc_local(&config, GcMode::Cli).unwrap();
+        let stats = crate::report::read_gc_stats(&config.cache_dir).unwrap();
+        assert_eq!(stats.source, "manual");
+    }
+
+    /// Every driver records through record_gc_run; the local one shows the
+    /// history is wired in and stays off until record_sessions asks for it.
+    #[test]
+    fn local_gc_appends_to_the_gc_history_only_when_record_sessions_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        run_gc_local(&config, GcMode::Cli).unwrap();
+        assert!(!config.cache_dir.join("telemetry").exists());
+
+        config.record_sessions = true;
+        run_gc_local(&config, GcMode::Background).unwrap();
+        let log =
+            std::fs::read_to_string(crate::report::gc_runs_log_path(&config.cache_dir)).unwrap();
+        let records: Vec<crate::report::GcRunRecord> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1, "{log}");
+        assert_eq!(records[0].source, "auto");
+    }
+
+    #[test]
+    fn stale_schema_gc_records_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        gc(&config, None, true, true).unwrap();
+
+        let stats =
+            crate::report::read_gc_stats(&config.cache_dir).expect("stale-schema run recorded");
+        assert_eq!(stats.source, "manual");
+    }
+
+    /// `kache gc --max-age` with no reachable daemon evicts locally; that run
+    /// counts like any other.
+    #[test]
+    fn age_gc_without_a_daemon_records_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        let store = Store::open(&config).unwrap();
+        let _gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
+
+        evict_older_than_recorded(&store, &config, 24).unwrap();
+
+        let stats = crate::report::read_gc_stats(&config.cache_dir).expect("age run recorded");
+        assert_eq!(stats.source, "manual");
+    }
+
+    #[test]
+    fn machine_snapshot_reads_a_store_without_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        let empty = machine_snapshot(&config);
+        assert!(empty.index_bytes.is_none());
+        assert!(empty.wal_bytes.is_none());
+        assert!(empty.rowid_high_water.is_empty());
+        assert!(empty.gc.is_none());
+        assert!(
+            !config.index_db_path().exists(),
+            "a snapshot must never create the index"
+        );
+
+        drop(Store::open(&config).unwrap());
+        crate::report::record_gc_run(&config, "auto", &crate::store::GcStats::default()).unwrap();
+        let snap = machine_snapshot(&config);
+        let db_len = std::fs::metadata(config.index_db_path()).unwrap().len();
+        let mut wal_path = config.index_db_path().into_os_string();
+        wal_path.push("-wal");
+        let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(snap.wal_bytes, Some(wal_len));
+        assert_eq!(snap.index_bytes, Some(db_len + wal_len));
+        let tables: Vec<_> = snap
+            .rowid_high_water
+            .iter()
+            .map(|(table, _)| *table)
+            .collect();
+        assert!(
+            tables.contains(&"entries") && tables.contains(&"blobs"),
+            "{tables:?}"
+        );
+        assert_eq!(snap.gc.expect("gc_stats.json read").source, "auto");
+    }
+
+    /// The last read-write connection to a WAL database checkpoints on close,
+    /// copying the WAL into `index.db`: a write, on a 27 GiB file, that a
+    /// snapshot must never make. A read-only connection leaves both files as
+    /// it found them.
+    #[test]
+    fn machine_snapshot_never_checkpoints_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        drop(Store::open(&config).unwrap());
+        let db_path = config.index_db_path();
+        let mut wal_path = db_path.clone().into_os_string();
+        wal_path.push("-wal");
+        {
+            // A writer that exits without checkpointing, as a killed build does.
+            let writer = rusqlite::Connection::open(&db_path).unwrap();
+            writer
+                .set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )
+                .unwrap();
+            writer
+                .execute_batch(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     CREATE TABLE probe (x INTEGER);
+                     INSERT INTO probe VALUES (1);",
+                )
+                .unwrap();
+        }
+        let db_before = std::fs::read(&db_path).unwrap();
+        let wal_before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_before > 0, "the setup leaves frames in the WAL");
+
+        machine_snapshot(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            db_before,
+            "index.db must not be written"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).map(|m| m.len()).ok(),
+            Some(wal_before),
+            "the WAL must be left in place"
+        );
+    }
+
+    /// The GC line grows a suffix only when there is something to report:
+    /// zero failures and zero write time add nothing, one of each adds both.
+    /// A record without a driver predates `source`, when only the daemon
+    /// wrote one.
+    #[test]
+    fn stats_gc_line_suffixes_start_at_one() {
+        let gc_line = |failed: usize, locked: usize, write_ms: u64, source: &str| {
+            machine_lines(&crate::otel::MachineSnapshot {
+                gc: Some(crate::report::GcStatsPersisted {
+                    last_run: "2026-09-12T12:11:05+00:00".to_string(),
+                    source: source.to_string(),
+                    entries_evicted: 3,
+                    entries_failed: failed,
+                    entries_locked: locked,
+                    evict_write_ms: write_ms,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            gc_line(0, 0, 0, "manual"),
+            vec!["GC:        last run 2026-09-12T12:11:05+00:00 (manual): 3 evicted".to_string()]
+        );
+        assert_eq!(
+            gc_line(1, 1, 1, ""),
+            vec![
+                "GC:        last run 2026-09-12T12:11:05+00:00 (daemon): 3 evicted, 1 failed (1 lost the index write lock), 1 ms in index writes"
+                    .to_string()
+            ]
+        );
+        let index_only = machine_lines(&crate::otel::MachineSnapshot {
+            index_bytes: Some(4096),
+            ..Default::default()
+        });
+        assert_eq!(index_only, vec![format!("Index:     {}", ByteSize(4096))]);
+    }
+
+    #[test]
+    fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
+        let machine = crate::otel::MachineSnapshot {
+            index_bytes: Some(29_074_419_712),
+            wal_bytes: Some(1_073_741_824),
+            rowid_high_water: vec![
+                ("entries", 2),
+                ("file_hashes", 13_286_285),
+                ("cc_preprocess_memos", 874_517),
+                ("eviction_tombstones", 5_425_819),
+                ("blobs", 5),
+            ],
+            gc: Some(crate::report::GcStatsPersisted {
+                last_run: "2026-09-12T12:11:05+00:00".to_string(),
+                source: "auto".to_string(),
+                entries_failed: 40,
+                entries_locked: 40,
+                evict_write_ms: 4200,
+                ..Default::default()
+            }),
+        };
+        let lines = machine_lines(&machine);
+        assert!(lines[0].starts_with("Index:"), "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                "{}, WAL {} (rowid high-water:",
+                ByteSize(29_074_419_712),
+                ByteSize(1_073_741_824)
+            )),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("(rowid high-water: file_hashes 13286285"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines[0].contains("blobs"),
+            "only the three largest tables: {lines:?}"
+        );
+        assert!(lines[1].contains("(auto)"), "{lines:?}");
+        assert!(
+            lines[1].contains("40 lost the index write lock"),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with(", 4200 ms in index writes"), "{lines:?}");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
+    }
+
+    /// Why the figure is not called rows: `INSERT OR REPLACE` on a TEXT key,
+    /// the way `file_hashes` and the memo tables are written, deletes the old
+    /// row and inserts the new one at the next rowid.
+    #[test]
+    fn rowid_high_water_counts_replacements_not_rows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE file_hashes (path TEXT PRIMARY KEY, hash TEXT)")
+            .unwrap();
+        for hash in ["a", "b", "c"] {
+            db.execute(
+                "INSERT OR REPLACE INTO file_hashes VALUES ('src/lib.rs', ?1)",
+                [hash],
+            )
+            .unwrap();
+        }
+        let high_water: i64 = db
+            .query_row(&rowid_high_water_sql("file_hashes"), [], |row| row.get(0))
+            .unwrap();
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM file_hashes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((high_water, rows), (3, 1));
+    }
+
+    /// The rowid high-water mark on a 27 GiB index must not read the table.
+    /// The query seeks to the last row (`Last`) and stops, so its step count does
+    /// not grow with the table; a scan steps once per row, and `COUNT(*)` is a
+    /// single `Count` step that still reads every page.
+    #[test]
+    fn index_row_figures_seek_instead_of_scanning() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE memos (key TEXT PRIMARY KEY, body BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO memos SELECT 'k' || i, zeroblob(64) FROM n;",
+        )
+        .unwrap();
+
+        let mut stmt = db.prepare(&rowid_high_water_sql("memos")).unwrap();
+        let top: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(top, 5000);
+        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(steps < 100, "{steps} VM steps for one high-water mark");
+
+        let mut explain = db
+            .prepare(&format!("EXPLAIN {}", rowid_high_water_sql("memos")))
+            .unwrap();
+        let opcodes: Vec<String> = explain
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(opcodes.iter().any(|op| op == "Last"), "{opcodes:?}");
+        assert!(!opcodes.iter().any(|op| op == "Count"), "{opcodes:?}");
+    }
+
+    /// `kache stats` must not stall behind the index. The store's own busy
+    /// timeout is 5 s per statement; the snapshot gives up after 25 ms and
+    /// drops the figures it could not read.
+    #[test]
+    fn machine_snapshot_skips_row_figures_on_a_locked_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        drop(Store::open(&config).unwrap());
+        let holder = rusqlite::Connection::open(config.index_db_path()).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; \
+                 DELETE FROM entries WHERE 0;",
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let snap = machine_snapshot(&config);
+        let waited = started.elapsed();
+
+        assert!(snap.index_bytes.is_some(), "file sizes need no lock");
+        assert!(
+            snap.rowid_high_water.is_empty(),
+            "{:?}",
+            snap.rowid_high_water
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(4),
+            "waited {waited:?} on a locked index"
+        );
+        holder.execute_batch("COMMIT").unwrap();
+    }
+
+    fn report_run(config: &Config, out: &std::path::Path, record: bool) {
+        report(
+            config,
+            "json",
+            SinceWindow::DEFAULT,
+            crate::report::ReportFilter {
+                root: Some(std::path::PathBuf::from("/ci/runner-3/_work/secret-repo")),
+                last_build: false,
+            },
+            Some(out.join("report.json")),
+            10,
+            record,
+        )
+        .unwrap();
+    }
+
+    /// Every file under `dir` with its contents.
+    fn tree_contents(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let body = std::fs::read(&path).unwrap();
+                    files.push((path, body));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// `record_sessions` (env or config) makes a plain `kache report` record
+    /// exactly as `--record` would, so a host can opt in once for every job.
+    #[test]
+    fn report_records_without_the_flag_when_record_sessions_is_on() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(cache.path().to_path_buf(), None);
+        config.record_sessions = true;
+
+        report_run(&config, out.path(), false);
+
+        let log = std::fs::read_to_string(session_log_path(&config)).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        let record: crate::report::SessionRecord =
+            serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(record.schema, crate::report::SESSION_RECORD_SCHEMA);
+    }
+
+    /// Recording is opt-in: a plain `kache report` leaves the cache dir
+    /// exactly as it found it.
+    #[test]
+    fn report_without_record_leaves_the_cache_dir_unchanged() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(cache.path().to_path_buf(), None);
+        drop(Store::open(&config).unwrap());
+        let before = tree_contents(cache.path());
+
+        report_run(&config, out.path(), false);
+
+        assert!(out.path().join("report.json").is_file());
+        assert!(!cache.path().join("telemetry").exists());
+        assert_eq!(tree_contents(cache.path()), before);
+    }
+
+    /// The report reads events from the runtime dir, which CI deletes with the
+    /// job, so a recorded session has to land in the cache dir, without the
+    /// path.
+    #[test]
+    fn report_record_appends_one_line_to_the_cache_dir_not_the_runtime_dir() {
+        let cache = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(cache.path().to_path_buf(), None);
+        config.runtime_dir = runtime.path().to_path_buf();
+        let line_count = || {
+            std::fs::read_to_string(session_log_path(&config))
+                .unwrap()
+                .lines()
+                .count()
+        };
+
+        report_run(&config, out.path(), true);
+        assert_eq!(line_count(), 1, "one line per recorded session");
+        report_run(&config, out.path(), true);
+        assert_eq!(line_count(), 2, "a second record appends, never rewrites");
+
+        assert!(!runtime.path().join("telemetry").exists());
+        let log = std::fs::read_to_string(session_log_path(&config)).unwrap();
+        let lines: Vec<_> = log.lines().collect();
+        assert!(
+            !log.contains("secret-repo"),
+            "the root is hashed, never written"
+        );
+        let record: crate::report::SessionRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record.schema, crate::report::SESSION_RECORD_SCHEMA);
+        assert_eq!(record.root_hash.as_deref().map(str::len), Some(16));
+        assert_eq!(record.summary.total_crates, 0);
+        assert_eq!(record.machine.store_max, config.max_size);
+    }
+
+    /// Recording is a side effect. A cache dir it cannot write (a read-only
+    /// mount, another owner) costs the session line, never the report.
+    #[test]
+    fn report_record_that_cannot_write_still_delivers_the_report() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(cache.path().to_path_buf(), None);
+        // A file where the telemetry dir goes fails create_dir_all the way a
+        // read-only mount does, and root cannot write past it.
+        std::fs::write(cache.path().join("telemetry"), b"").unwrap();
+
+        let result = report(
+            &config,
+            "json",
+            SinceWindow::DEFAULT,
+            crate::report::ReportFilter {
+                root: None,
+                last_build: false,
+            },
+            Some(out.path().join("report.json")),
+            10,
+            true,
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.path().join("report.json").is_file());
     }
 
     #[test]
@@ -8092,6 +8795,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
