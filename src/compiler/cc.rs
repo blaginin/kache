@@ -24,10 +24,10 @@
 //! What passes through (refused, see [`CcArgs::refuse_reasons`]):
 //! - Link mode unless `[cache] cache_cc_links` / `KACHE_CACHE_CC_LINKS` is on
 //!   (epic #762 / #259)
-//! - Preprocess (`-E`) / assemble (`-S`) modes
+//! - Assemble (`-S`) mode
 //! - Multi-source compiles, multi-arch fat binaries
 //! - Response files, coverage instrumentation, split DWARF,
-//!   precompiled headers, modules, output-to-stdout
+//!   precompiled headers, modules, `-o -`
 //! - Any flag not classified by [`CC_FLAGS`] (see [`classify_cc_flag`])
 //!   — an unmodeled codegen flag, a cross-target, profiling, or simply
 //!   a flag kache has not classified. Refused so an unknown flag is
@@ -50,7 +50,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -70,6 +70,20 @@ pub enum ToolFamily {
     Clang,
     /// clang in MSVC driver mode (`clang-cl` or `--driver-mode=cl`).
     ClangCl,
+}
+
+/// Store name for a `-E` expansion that went to stdout (no `-o`).
+pub(crate) const CC_STDOUT_STORE_NAME: &str = "stdout.i";
+
+/// `-E` without `-o` (and without `-o -`): the expansion is process stdout.
+pub(crate) fn cc_expansion_is_stdout(parsed: &CcArgs) -> bool {
+    parsed.mode == CompileMode::Preprocess && parsed.output.is_none()
+}
+
+/// The `-E -P` / `/EP` key probe sets this so a kache shim does not cache
+/// the probe as a user-facing stdout preprocess.
+pub(crate) fn cc_is_internal_key_probe() -> bool {
+    std::env::var_os("KACHE_CC_KEY_PROBE").is_some()
 }
 
 impl ToolFamily {
@@ -701,9 +715,8 @@ impl CcArgs {
     ///   anything it does not classify is refused with the offending
     ///   flags named in the reason.
     /// - **Output to stdout** (`-o -`): not a cacheable artifact.
-    /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
-    ///   developer-facing output that's rarely worth caching and
-    ///   tangles with the cc-crate probe pattern.
+    /// - **Assemble mode**: `-S` is still refused. `-E` to a named file
+    ///   or to stdout is cached.
     pub fn refuse_reasons(&self, extra_allowlist_flags: &[String]) -> Vec<RefuseReason> {
         let mut reasons = Vec::new();
 
@@ -728,14 +741,8 @@ impl CcArgs {
             CompileMode::Link => reasons.push(RefuseReason::Unsupported(
                 "cc link mode (whole-program caching) — not yet",
             )),
-            // `-E` writing to a named file is an ordinary single-output
-            // compile: the expansion is the artifact, and the key already
-            // covers everything that can change it. Writing to stdout would
-            // need the entry to carry an output no file holds, so that shape
-            // keeps its own refusal and stays countable.
-            CompileMode::Preprocess if self.output.is_none() => reasons.push(
-                RefuseReason::Unsupported("cc preprocessor mode -E to stdout — not yet"),
-            ),
+            // `-E` to a named file or to stdout is a single-output compile:
+            // the expansion is the artifact. `-o -` is still refused below.
             CompileMode::Preprocess => {}
             CompileMode::Assemble => {
                 reasons.push(RefuseReason::Unsupported("cc assembly mode -S — not yet"))
@@ -2131,6 +2138,10 @@ fn preprocess_hash(
         crate::opcounts::record_preprocessor_run();
         let mut command = Command::new(&parsed.program);
         command.args(args);
+        // If `program` is a kache shim, this probe must not re-enter the
+        // cache (it would try to key another -E to stdout). The wrapper
+        // passthroughs when this is set.
+        command.env("KACHE_CC_KEY_PROBE", "1");
         // Pin the build timestamp so `__DATE__` / `__TIME__` expand
         // deterministically. The real compile uses the same value.
         if let Some(epoch) = effective_source_date_epoch() {
@@ -6314,34 +6325,48 @@ impl Compiler for CcCompiler {
         let discovers_outputs = matches!(parsed.mode, CompileMode::Compile)
             || (parsed.mode == CompileMode::Link && self.cache_cc_links)
             || (parsed.mode == CompileMode::Preprocess && parsed.output.is_some());
-        let artifacts = if exit_code == 0 && discovers_outputs {
+        let mut keepalive = Vec::new();
+        let mut artifacts = if exit_code == 0 && discovers_outputs {
             discover_cc_output_artifacts(parsed)
         } else {
             ArtifactSet::empty()
         };
-        // Safety net for #1004. The key probe catches roots in the expansion.
-        // A root that reaches the object some other way would still be stored
-        // under a key every checkout shares, so keep the object for this build
-        // and store nothing. It only sees roots spelled out as plain bytes.
-        let unsafe_to_store =
-            cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
-                parsed
-                    .object_output_path()
-                    .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
-            });
-        let artifacts = match unsafe_to_store {
-            None => artifacts,
-            Some(reason) => {
-                tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
-                ArtifactSet::empty()
+        if exit_code == 0 && cc_expansion_is_stdout(parsed) {
+            match stage_cc_stdout_artifact(&output.stdout) {
+                Ok((artifact, temp)) => {
+                    artifacts = ArtifactSet::new(vec![artifact]);
+                    keepalive.push(temp);
+                }
+                Err(error) => {
+                    tracing::warn!("cc: staging -E stdout failed: {error:#}; not caching it");
+                }
             }
-        };
+        } else {
+            // Safety net for #1004. The key probe catches roots in the expansion.
+            // A root that reaches the object some other way would still be stored
+            // under a key every checkout shares, so keep the object for this build
+            // and store nothing. It only sees roots spelled out as plain bytes.
+            let unsafe_to_store =
+                cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
+                    parsed
+                        .object_output_path()
+                        .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
+                });
+            artifacts = match unsafe_to_store {
+                None => artifacts,
+                Some(reason) => {
+                    tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
+                    ArtifactSet::empty()
+                }
+            };
+        }
 
         Ok(CompileResult {
             exit_code,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             artifacts,
+            keepalive,
         })
     }
 
@@ -6353,6 +6378,30 @@ impl Compiler for CcCompiler {
         // .dylib, etc.).
         classify_by_filename(name)
     }
+}
+
+fn stage_cc_stdout_artifact(bytes: &[u8]) -> Result<(Artifact, tempfile::TempPath)> {
+    let mut staged = tempfile::Builder::new()
+        .prefix("kache-cc-stdout-")
+        .suffix(".i")
+        .tempfile()
+        .context("cc: creating -E stdout staging file")?;
+    staged
+        .write_all(bytes)
+        .context("cc: writing -E stdout staging file")?;
+    staged
+        .flush()
+        .context("cc: flushing -E stdout staging file")?;
+    let temp = staged.into_temp_path();
+    Ok((
+        Artifact {
+            path: temp.to_path_buf(),
+            store_name: CC_STDOUT_STORE_NAME.to_string(),
+            kind: ArtifactKind::Other("stdout"),
+            required: true,
+        },
+        temp,
+    ))
 }
 
 fn expand_cc_response_files(args: &[String]) -> Result<Vec<String>> {
@@ -8257,8 +8306,8 @@ mod tests {
         );
         let stdout = refuse_descriptions(&["clang-cl", "-E", "foo.c"]);
         assert!(
-            stdout.iter().any(|d| d.contains("to stdout")),
-            "-E to stdout is not a flag row: {stdout:?}"
+            !stdout.iter().any(|d| d.contains("to stdout")),
+            "-E to stdout must cache, got: {stdout:?}"
         );
     }
 
@@ -10027,12 +10076,8 @@ mod tests {
     fn preprocess_mode_refusal_does_not_report_classified_flags_as_unsupported() {
         let descs = refuse_descriptions(&["cc", "-E", "-xc", "-P", "foo.c"]);
         assert!(
-            descs.iter().any(|d| d.contains("preprocessor mode")),
-            "expected preprocessor-mode refuse, got: {descs:?}"
-        );
-        assert!(
-            !descs.iter().any(|d| d.contains("unsupported flag")),
-            "classified preprocess args should not be reported unsupported: {descs:?}"
+            descs.is_empty(),
+            "-E to stdout with classified flags must cache, got: {descs:?}"
         );
     }
 
@@ -10040,8 +10085,8 @@ mod tests {
     fn refuses_preprocess_and_assemble_modes() {
         let preprocess = refuse_descriptions(&["cc", "-E", "foo.c"]);
         assert!(
-            preprocess.iter().any(|d| d.contains("preprocessor")),
-            "expected preprocessor-mode refuse, got: {preprocess:?}"
+            preprocess.is_empty(),
+            "-E to stdout must cache, got: {preprocess:?}"
         );
 
         let assemble = refuse_descriptions(&["cc", "-S", "foo.c"]);
@@ -10061,28 +10106,14 @@ mod tests {
     fn non_compile_refusal_does_not_carry_unsupported_flag_noise() {
         let compiler = CcCompiler::new();
 
-        // Preprocessor mode. Pre-refactor this returned BOTH
-        // "unsupported flag(s): -xc -P -E" AND "preprocessor mode
-        // (-E)", inflating the "classifier gap" bucket. Post-refactor
-        // only the mode refusal fires.
+        // Preprocessor-to-stdout is cacheable; classified flags must not
+        // invent an "unsupported flag" refusal.
         let parsed = compiler
             .parse(&s(&["cc", "-xc", "-P", "-E", "foo.c"]))
             .unwrap();
         let reasons = compiler.refuse_reasons(&parsed);
         let descs: Vec<_> = reasons.iter().map(|r| r.description()).collect();
-        assert!(
-            descs.iter().any(|d| d.contains("preprocessor mode")),
-            "preprocessor mode must be reported, got: {descs:?}"
-        );
-        assert!(
-            !descs.iter().any(|d| d.contains("unsupported flag")),
-            "preprocessor-mode refusal must not carry 'unsupported flag' noise, got: {descs:?}"
-        );
-        // Must read as a deferral, not a permanent limitation.
-        assert!(
-            descs.iter().any(|d| d.contains("— not yet")),
-            "preprocessor mode message must read as deferral ('— not yet'), got: {descs:?}"
-        );
+        assert!(descs.is_empty(), "-E to stdout must cache, got: {descs:?}");
 
         // Link mode — also `Unsupported` with "— not yet".
         // Same short-circuit: the flag classifier's complaint about
@@ -11839,11 +11870,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// `-E` to a named file is a cacheable single-output compile; `-E` to
-    /// stdout still is not, and says so in its own words so the two can be
-    /// counted apart in a report.
+    /// `-E` to a named file and `-E` to stdout are both cacheable.
+    /// `-o -` is still refused.
     #[test]
-    fn preprocess_to_a_file_is_cacheable_and_to_stdout_is_not() {
+    fn preprocess_to_a_file_and_to_stdout_are_cacheable() {
         let to_file = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "unit.i"])).unwrap();
         assert_eq!(to_file.mode, CompileMode::Preprocess);
         assert!(
@@ -11858,13 +11888,144 @@ mod tests {
         );
 
         let to_stdout = CcArgs::parse(&s(&["cc", "-E", "unit.c"])).unwrap();
-        let reasons = to_stdout.refuse_reasons(&[]);
+        assert_eq!(to_stdout.mode, CompileMode::Preprocess);
+        assert!(to_stdout.output.is_none(), "-E without -o writes stdout");
+        assert!(
+            to_stdout.refuse_reasons(&[]).is_empty(),
+            "-E to stdout must cache: {:?}",
+            to_stdout.refuse_reasons(&[])
+        );
+
+        let dash_o = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "-"])).unwrap();
+        let reasons = dash_o.refuse_reasons(&[]);
         assert!(
             reasons.iter().any(|reason| matches!(
                 reason,
                 RefuseReason::Unsupported(message) if message.contains("to stdout")
             )),
-            "stdout has no file to store: {reasons:?}"
+            "-o - is still refused: {reasons:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_stages_preprocess_stdout_as_an_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("unit.c");
+        std::fs::write(&source, "int kache_stdout_marker;\n").unwrap();
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&["cc", "-E", source.to_str().unwrap()]))
+            .unwrap();
+        assert!(parsed.output.is_none());
+        let result = execute_retrying_etxtbsy(&compiler, &parsed).expect("cc -E should run");
+        assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+        assert_eq!(result.artifacts.outputs().len(), 1);
+        assert_eq!(
+            result.artifacts.outputs()[0].store_name,
+            CC_STDOUT_STORE_NAME
+        );
+        let staged = std::fs::read(&result.artifacts.outputs()[0].path).unwrap();
+        assert!(
+            staged
+                .windows(b"kache_stdout_marker".len())
+                .any(|w| w == b"kache_stdout_marker"),
+            "staged stdout must hold the expansion, got {}",
+            String::from_utf8_lossy(&staged)
+        );
+        assert!(
+            result.stdout.contains("kache_stdout_marker"),
+            "miss path still prints the expansion on stdout"
+        );
+        assert!(
+            !result.keepalive.is_empty(),
+            "the staging file must outlive execute"
+        );
+    }
+
+    #[test]
+    fn cc_expansion_is_stdout_only_without_dash_o() {
+        let stdout = CcArgs::parse(&s(&["cc", "-E", "unit.c"])).unwrap();
+        let named = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "unit.i"])).unwrap();
+        let compile = CcArgs::parse(&s(&["cc", "-c", "unit.c", "-o", "unit.o"])).unwrap();
+        assert!(cc_expansion_is_stdout(&stdout));
+        assert!(!cc_expansion_is_stdout(&named));
+        assert!(!cc_expansion_is_stdout(&compile));
+    }
+
+    #[test]
+    fn cc_is_internal_key_probe_reads_the_probe_env() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let previous = std::env::var_os("KACHE_CC_KEY_PROBE");
+        unsafe {
+            std::env::remove_var("KACHE_CC_KEY_PROBE");
+        }
+        assert!(!cc_is_internal_key_probe());
+        unsafe {
+            std::env::set_var("KACHE_CC_KEY_PROBE", "1");
+        }
+        assert!(cc_is_internal_key_probe());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("KACHE_CC_KEY_PROBE", value),
+                None => std::env::remove_var("KACHE_CC_KEY_PROBE"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stdout_preprocess_does_not_stage_an_artifact() {
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&["cc", "-E", "/no/such/kache-missing.c"]))
+            .unwrap();
+        let result = execute_retrying_etxtbsy(&compiler, &parsed).expect("cc -E should spawn");
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            result.artifacts.is_empty(),
+            "a failed -E must not cache stdout, got {:?}",
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .map(|a| &a.store_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_named_preprocess_does_not_stage_stdout_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("unit.c");
+        let out = dir.path().join("unit.i");
+        std::fs::write(&source, "int named;\n").unwrap();
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&[
+                "cc",
+                "-E",
+                source.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ]))
+            .unwrap();
+        let result = execute_retrying_etxtbsy(&compiler, &parsed).expect("cc -E -o should run");
+        assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+        assert!(
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .all(|a| a.store_name != CC_STDOUT_STORE_NAME),
+            "named -E must not replace the -o file with a stdout blob, got {:?}",
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .map(|a| &a.store_name)
+                .collect::<Vec<_>>()
         );
     }
 

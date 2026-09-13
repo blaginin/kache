@@ -1248,6 +1248,7 @@ impl Compiler for NvccCompiler {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             artifacts,
+            keepalive: Vec::new(),
         })
     }
 
