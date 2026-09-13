@@ -10209,6 +10209,7 @@ mod tests {
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: false,
             preserve_incremental: false,
             adaptive_incremental: true,

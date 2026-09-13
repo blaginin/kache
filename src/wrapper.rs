@@ -763,6 +763,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
+        .with_cache_cc_links(config.cache_cc_links)
         .with_base_dirs(config.base_dirs.clone());
     let parsed = compiler
         .parse(wrapper_args)
@@ -1139,7 +1140,10 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "admission: compile too cheap to store"
         );
     }
-    if store_decision.should_store && !compiler.include_dir_names_still_match(&parsed) {
+    if store_decision.should_store
+        && cc_store_revalidates_include_dirs(parsed.mode)
+        && !compiler.include_dir_names_still_match(&parsed)
+    {
         tracing::debug!(
             crate_name = %crate_name,
             "cc include-dir names changed during compile; skipping store"
@@ -1357,6 +1361,10 @@ fn cc_preprocess_restore_target(
     names_match.then_some(target)
 }
 
+fn cc_store_revalidates_include_dirs(mode: crate::compiler::cc::CompileMode) -> bool {
+    mode == crate::compiler::cc::CompileMode::Compile
+}
+
 fn cc_cache_entry_rejection_reason(
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
@@ -1370,23 +1378,25 @@ fn cc_cache_entry_rejection_reason(
         .iter()
         .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
 
-    // A preprocess names its own output and it is not an object, so require
-    // that the entry carries the file this invocation asked for rather than
-    // an object it was never going to produce.
-    let wants_object = parsed.mode != crate::compiler::cc::CompileMode::Preprocess;
     let has_named_output = meta
         .files
         .iter()
         .any(|file| cc_preprocess_restore_target(parsed, &file.name).is_some());
 
-    if wants_object && !has_object {
-        Some("matching entry lacks the object artifact required by this invocation")
-    } else if !wants_object && !has_named_output {
-        Some("matching entry lacks the preprocessed output required by this invocation")
-    } else if parsed.depinfo_output_path().is_some() && !has_depinfo {
-        Some("matching entry lacks dep-info required by this invocation")
-    } else {
-        None
+    match parsed.mode {
+        crate::compiler::cc::CompileMode::Compile if !has_object => {
+            Some("matching entry lacks the object artifact required by this invocation")
+        }
+        crate::compiler::cc::CompileMode::Preprocess if !has_named_output => {
+            Some("matching entry lacks the preprocessed output required by this invocation")
+        }
+        crate::compiler::cc::CompileMode::Link if meta.files.is_empty() => {
+            Some("matching entry lacks the link artifact required by this invocation")
+        }
+        _ if parsed.depinfo_output_path().is_some() && !has_depinfo => {
+            Some("matching entry lacks dep-info required by this invocation")
+        }
+        _ => None,
     }
 }
 
@@ -1637,6 +1647,28 @@ fn restore_cc_from_cache(
                     continue;
                 }
             },
+            ArtifactKind::Executable
+            | ArtifactKind::DynamicLibrary
+            | ArtifactKind::WasmModule
+            | ArtifactKind::Other("extensionless")
+                if parsed.mode == crate::compiler::cc::CompileMode::Link =>
+            {
+                parsed
+                    .object_output_path()
+                    .context("cc restore: cannot determine link output path")?
+            }
+            ArtifactKind::DebugSidecar
+            | ArtifactKind::DebugBundle
+            | ArtifactKind::Library
+            | ArtifactKind::Other(_)
+                if parsed.mode == crate::compiler::cc::CompileMode::Link =>
+            {
+                let parent = parsed
+                    .object_output_path()
+                    .and_then(|path| path.parent().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                parent.join(&cached.name)
+            }
             // Anything else is this invocation's own preprocessor output or
             // nothing we can place. Asking once keeps the answer and the
             // decision to use it from ever disagreeing.
@@ -1674,7 +1706,20 @@ fn restore_cc_from_cache(
             &depinfo_anchor,
         )?);
     }
-    publish_prepared_cc_artifacts(prepared)
+    publish_prepared_cc_artifacts(prepared)?;
+    #[cfg(unix)]
+    if parsed.mode == crate::compiler::cc::CompileMode::Link
+        && let Some(output) = parsed.object_output_path()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&output)
+            .with_context(|| format!("cc restore: stat {}", output.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&output, permissions)
+            .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
+    }
+    Ok(())
 }
 
 /// After a local miss, ask the daemon for an exact remote entry.
@@ -5932,6 +5977,7 @@ mod tests {
             socket_path_override: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -7018,6 +7064,91 @@ mod tests {
             cc_cache_entry_rejection_reason(&compile, &entry("unit.i")),
             Some("matching entry lacks the object artifact required by this invocation")
         );
+
+        let link_args: Vec<String> = ["cc", "a.o", "b.o", "-o", "prog"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        let link = CcArgs::parse(&link_args).unwrap();
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&link, &entry_meta_with_files(&[])),
+            Some("matching entry lacks the link artifact required by this invocation"),
+            "an empty link entry cannot serve the binary"
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&link, &entry("prog")),
+            None,
+            "any stored file is enough for a link hit"
+        );
+        assert!(
+            cc_store_revalidates_include_dirs(crate::compiler::cc::CompileMode::Compile),
+            "object compiles re-check include-dir names before store"
+        );
+        assert!(
+            !cc_store_revalidates_include_dirs(crate::compiler::cc::CompileMode::Link),
+            "links have no include-dir snapshot and must still store"
+        );
+    }
+
+    #[test]
+    fn restore_cc_from_cache_writes_the_link_binary_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let bin_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let map_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        create_blob(&store, bin_hash, b"ELF");
+        create_blob(&store, map_hash, b"MAP");
+
+        let output = dir.path().join("out");
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "a.o", "b.o", "-o", &output_str]))
+            .unwrap();
+        let meta = entry_meta(
+            "cc-link-key",
+            vec![
+                cached_file("app", bin_hash),
+                cached_file("app.map", map_hash),
+            ],
+            &[],
+        );
+
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"ELF",
+            "the primary link artifact must land at -o even when the stored name differs"
+        );
+        assert!(
+            !dir.path().join("app").exists(),
+            "the stored extensionless name is not the restore destination"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("app.map")).unwrap(),
+            b"MAP",
+            "link sidecars must land next to the binary under their stored name"
+        );
+
+        let object = dir.path().join("unit.o");
+        let object_str = object.to_string_lossy().into_owned();
+        let compile = CcCompiler::new()
+            .parse(&s(&["cc", "-c", "unit.c", "-o", &object_str]))
+            .unwrap();
+        restore_cc_from_cache(&store, &compile, &meta).unwrap();
+        assert!(
+            !object.exists(),
+            "an executable blob must not restore onto a compile -o path"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o100,
+                0,
+                "restored link outputs must be owner-executable"
+            );
+        }
     }
 
     #[test]

@@ -104,6 +104,10 @@ pub struct Config {
     pub remote_error: Option<String>,
     pub disabled: bool,
     pub cache_executables: bool,
+    /// Opt-in C/C++ whole-program link caching (epic #762 / #259). Off by
+    /// default until path/repro gates pass. `KACHE_CACHE_CC_LINKS` or
+    /// `[cache] cache_cc_links`.
+    pub cache_cc_links: bool,
     pub clean_incremental: bool,
     /// Keep rustc incremental compilation for Cargo mutation workloads by
     /// bypassing artifact caching and isolating their incremental state.
@@ -669,6 +673,7 @@ pub(crate) struct CacheFileConfig {
     /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
     pub(crate) ignore_env: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
+    pub(crate) cache_cc_links: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
@@ -763,6 +768,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) cache_dir: bool,
     pub(crate) max_size: bool,
     pub(crate) cache_executables: bool,
+    pub(crate) cache_cc_links: bool,
     pub(crate) clean_incremental: bool,
     pub(crate) preserve_incremental: bool,
     pub(crate) adaptive_incremental: bool,
@@ -793,6 +799,7 @@ impl EnvOverrides {
             cache_dir: env_or_ignored("KACHE_CACHE_DIR", ignore_env).is_ok(),
             max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
+            cache_cc_links: env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env).is_ok(),
             clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
             preserve_incremental: env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env).is_ok(),
             adaptive_incremental: env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env).is_ok(),
@@ -1002,6 +1009,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_RUNTIME_DIR",
     "KACHE_MAX_SIZE",
     "KACHE_CACHE_EXECUTABLES",
+    "KACHE_CACHE_CC_LINKS",
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_PRESERVE_INCREMENTAL",
     "KACHE_ADAPTIVE_INCREMENTAL",
@@ -1057,6 +1065,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_RUNTIME_DIR", "cache.runtime_dir"),
     ("KACHE_MAX_SIZE", "cache.local_max_size"),
     ("KACHE_CACHE_EXECUTABLES", "cache.cache_executables"),
+    ("KACHE_CACHE_CC_LINKS", "cache.cache_cc_links"),
     ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
     ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
@@ -1123,6 +1132,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
 /// every existing env -> file -> default fallback arm transparently skips the
 /// env value and takes the file/default. A drop-in for `std::env::var` on the
 /// file-backed settings (see [`IGNORE_ENV_GATED_VARS`]).
+fn env_flag_one_or_true(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
 fn env_or_ignored(name: &str, ignore_env: bool) -> Result<String, std::env::VarError> {
     if ignore_env {
         Err(std::env::VarError::NotPresent)
@@ -1240,6 +1253,17 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.cache_executables)
                     .unwrap_or(default_cache_executables())
+            });
+
+        let cache_cc_links = env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env)
+            .map(|v| env_flag_one_or_true(&v))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.cache_cc_links)
+                    .unwrap_or(false)
             });
 
         let clean_incremental = env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env)
@@ -1648,6 +1672,7 @@ impl Config {
             explain_miss,
             scheduler,
             cache_executables,
+            cache_cc_links,
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,
@@ -3380,6 +3405,19 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn cache_cc_links_env_one_and_true_enable_zero_does_not() {
+        for on in ["1", "true", "TRUE"] {
+            assert!(env_flag_one_or_true(on), "{on} must enable cache_cc_links");
+        }
+        for off in ["0", "false", "no", ""] {
+            assert!(
+                !env_flag_one_or_true(off),
+                "{off:?} must not enable cache_cc_links"
+            );
+        }
+    }
+
     struct TestEnvGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -5063,6 +5101,7 @@ remote_key_cache_refresh_secs = 900
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
                 cache_executables: Some(true),
+                cache_cc_links: None,
                 clean_incremental: Some(false),
                 preserve_incremental: Some(true),
                 adaptive_incremental: Some(false),
@@ -5533,6 +5572,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -5591,6 +5631,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -5645,6 +5686,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -5718,6 +5760,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -6374,6 +6417,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,
                 cache_executables: Some(true),
+                cache_cc_links: None,
                 clean_incremental: None,
                 preserve_incremental: None,
                 adaptive_incremental: None,
