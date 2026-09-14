@@ -217,10 +217,25 @@ impl Prober for NvccProber {
         if !dryrun.status.success() {
             anyhow::bail!("`{} --dryrun` exited {}", req.compiler, dryrun.status);
         }
-        let dryrun_text = String::from_utf8_lossy(&dryrun.stdout).into_owned();
+        // The plan goes to stderr on real toolkits (stdout carries only
+        // the banner); scan both, stdout first. Only the host binary
+        // path is read out — nothing here is hashed (see above).
+        let dryrun_text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&dryrun.stdout),
+            String::from_utf8_lossy(&dryrun.stderr)
+        );
         let host = find_nvcc_host_compiler(&dryrun_text).with_context(|| {
+            // Include the raw output (truncated): host discovery runs
+            // against real driver text exactly once per toolchain, and a
+            // format drift is otherwise undebuggable from the reason alone.
+            let mut shown: String =
+                dryrun_text.chars().take(1200).collect();
+            if dryrun_text.len() > shown.len() {
+                shown.push_str("…[truncated]");
+            }
             format!(
-                "`{} --dryrun` names no recognizable host compiler",
+                "`{} --dryrun` names no recognizable host compiler\n--- combined output ---\n{shown}",
                 req.compiler
             )
         })?;
@@ -1616,5 +1631,52 @@ mod tests {
                 nvcc.display()
             );
         }
+    }
+
+    /// The host-discovery failure carries the raw output for debugging:
+    /// long output gets a truncation marker, short output does not.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_probe_failure_marks_truncation() {
+        let temp = TempDir::new().unwrap();
+        // 2000 chars of host-less output: marker expected.
+        let long_garbage = "x".repeat(2000);
+        let long_nvcc = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-long",
+            &format!(
+                "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else printf '%s' '{long_garbage}'; fi"
+            ),
+        );
+        let req = ProbeRequest {
+            compiler: long_nvcc.to_str().unwrap(),
+            args: &[],
+            key_args: &[],
+            per_tu_paths: &[],
+            windows_aware: false,
+        };
+        let err = NvccProber.probe(&req).expect_err("must fail the probe");
+        assert!(
+            format!("{err:#}").contains("[truncated]"),
+            "long output must be marked"
+        );
+        // Short output: no marker.
+        let short_nvcc = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-short",
+            "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else printf '%s\\n' '#$ nothing here'; fi",
+        );
+        let req = ProbeRequest {
+            compiler: short_nvcc.to_str().unwrap(),
+            args: &[],
+            key_args: &[],
+            per_tu_paths: &[],
+            windows_aware: false,
+        };
+        let err = NvccProber.probe(&req).expect_err("must fail the probe");
+        assert!(
+            !format!("{err:#}").contains("[truncated]"),
+            "short output must not be marked"
+        );
     }
 }

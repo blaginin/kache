@@ -70,13 +70,19 @@ pub struct NvccArgs {
     pub sources: Vec<PathBuf>,
     /// `-o <file>`.
     pub output: Option<PathBuf>,
-    /// `-MF <file>` / `-MF<file>`: explicit dep-info sidecar. The only
-    /// dep-info shape v1 caches — bare `-M`/`-MD`/`-MMD` name the sidecar
-    /// implicitly (derived from the output), and an unvalidated guess at
-    /// nvcc's derivation is a misplaced-restore waiting to happen.
+    /// `-MF <file>` / `-MF<file>`: explicit dep-info sidecar. Cached
+    /// together with `-MD` / `-MMD`, which are the only generation modes
+    /// v1 accepts: per the driver docs the `-MF` path is only honored
+    /// with a generate-dependencies mode, and a bare `-MD` would leave
+    /// the sidecar name to an unvalidated derivation rule.
     pub depfile: Option<PathBuf>,
-    /// Bare `-M`/`-MM`/`-MD`/`-MMD`/`-MG`/`-MP`/`--generate-dependencies`:
-    /// refused (see `depfile`).
+    /// `-MD` / `-MMD`: generate dependencies *and* compile. Allowed only
+    /// together with an explicit `-MF` path (see `depfile`); on its own
+    /// the sidecar name is derived and v1 refuses to guess it.
+    pub depgen_with_compile: bool,
+    /// Bare `-M`/`-MM`/`-MG`/`-MP`/`--generate-dependencies`: always
+    /// refused (see `depfile`). `-M`/`-MM` also skip the compile, so
+    /// there is no object to cache.
     pub implicit_depfile: bool,
     /// `-dc` or `-rdc=true`: relocatable / separable device code.
     pub separate_device_code: bool,
@@ -203,6 +209,7 @@ impl NvccArgs {
             sources: Vec::new(),
             output: None,
             depfile: None,
+            depgen_with_compile: false,
             implicit_depfile: false,
             separate_device_code: false,
             device_debug: false,
@@ -320,10 +327,19 @@ impl NvccArgs {
                     parsed.xcompiler_values.push(value.to_string());
                     parsed.deferred_flags.push(arg.to_string());
                 }
-                // Bare `-M` family: nvcc derives the sidecar name from the
-                // output, and v1 does not guess at that derivation.
-                "-M" | "-MM" | "-MD" | "-MMD" | "-MG" | "-MP" | "--generate-dependencies" => {
+                // Bare `-M` family without compile: nvcc emits no object
+                // (and the sidecar name would be derived), so v1 refuses.
+                // `-MD`/`-MMD` are handled below: they compile, and are
+                // fine with an explicit `-MF` path.
+                "-M" | "-MM" | "-MG" | "-MP" | "--generate-dependencies" => {
                     parsed.implicit_depfile = true;
+                }
+                // `-MD`/`-MMD` generate dependencies *and* compile. Keyed
+                // verbatim (a different dep mode is a different build);
+                // the refuse check below requires an explicit `-MF` path.
+                "-MD" | "-MMD" => {
+                    parsed.depgen_with_compile = true;
+                    parsed.deferred_flags.push(arg.to_string());
                 }
                 _ if arg == "-rdc" => parsed.separate_device_code = true,
                 _ if arg.starts_with("-rdc=") || arg.starts_with("--relocatable-device-code=") => {
@@ -441,7 +457,12 @@ impl NvccArgs {
         }
         if self.implicit_depfile {
             reasons.push(RefuseReason::Unsupported(
-                "nvcc implicit depfile (-M/-MD/-MMD) — pass -MF <file> (not yet supported)",
+                "nvcc dependency-only mode (-M/-MM) — not yet supported",
+            ));
+        }
+        if self.depgen_with_compile && self.depfile.is_none() {
+            reasons.push(RefuseReason::Unsupported(
+                "nvcc implicit depfile (-MD/-MMD without -MF) — pass -MF <file> (not yet supported)",
             ));
         }
         if nvcc_xcompiler_smuggles_pp(&self.xcompiler_values) {
@@ -682,11 +703,62 @@ fn nvcc_dep_forward_args(deferred: &[String]) -> Vec<String> {
 /// Parse `nvcc -M` (make-style) output into dependency paths.
 ///
 /// Fail-closed: any construct this parser does not confidently model
-/// (unhandled escapes, missing colon, Windows drive-letter targets are
-/// handled; anything else) bails to passthrough. A dropped header
-/// would under-key the entry — the fatal direction — so doubt means
-/// refusal, never a guess.
+/// bails to passthrough. A dropped header would under-key the entry —
+/// the fatal direction — so doubt means refusal, never a guess.
+/// Conversely, unknown tokens never silently vanish: every parsed token
+/// becomes a hashed input, so trailing garbage fails the hash (missing
+/// file) instead of corrupting the key.
+/// Byte offset where the make rule starts: skip leading lines that
+/// cannot start one. Driver prologues (`nvcc warning : ...` on
+/// stdout) contain a colon but are not rules; without this skip the
+/// separator below would land inside the prologue and every word of
+/// it would become a (missing, bailing) dependency — correct but
+/// permanently uncached on toolkits that warn. A skipped-too-much
+/// mistake is equally safe: no rule found means bail, never a guess.
+fn leading_rule_offset(text: &str) -> usize {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line_has_rule_target(line) {
+            break;
+        }
+        offset += line.len();
+    }
+    offset
+}
+
+/// Could `line` start a make rule? The text before the first colon
+/// must be whitespace-free once backslash escapes are removed, so
+/// `kernel.o :`, `C:\x:` and `my\ dir/f.o:` qualify while `nvcc
+/// warning : ...` does not. Over-accepting is safe (unknown tokens
+/// fail the hash); under-accepting just bails.
+fn line_has_rule_target(line: &str) -> bool {
+    let mut unescaped = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+        } else {
+            chars.next();
+        }
+    }
+    match unescaped.find(':') {
+        Some(colon) => {
+            let target = unescaped[..colon].trim();
+            !target.is_empty() && !target.contains([' ', '\t'])
+        }
+        None => false,
+    }
+}
+
 fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
+    // Skip leading non-rule lines. Driver prologues (`nvcc warning :
+    // ...` on stdout) contain a colon but cannot start a make rule: a
+    // rule target has no unescaped whitespace before its colon (see
+    // `rule_separator_colon`). Without this, the separator below would
+    // land inside the prologue and every word of it would become a
+    // (missing, bailing) dependency — correct but permanently uncached
+    // on toolkits that warn.
+    let text = &text[leading_rule_offset(text)..];
     // Escaped spaces must survive the whitespace split below, so they
     // become a private-use placeholder first (restored after splitting).
     // Only two backslash sequences are escapes: a line continuation
@@ -1517,22 +1589,49 @@ mod tests {
 
     #[test]
     fn bare_depinfo_flags_set_implicit_depfile() {
-        for flag in [
-            "-M",
-            "-MM",
-            "-MD",
-            "-MMD",
-            "-MG",
-            "-MP",
-            "--generate-dependencies",
-        ] {
+        for flag in ["-M", "-MM", "-MG", "-MP", "--generate-dependencies"] {
             let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", flag]);
             assert!(parsed.implicit_depfile, "{flag} must set implicit_depfile");
             assert!(
                 parsed.refuse_reasons(&[]).iter().any(|r| {
-                    matches!(r, RefuseReason::Unsupported(d) if d.contains("implicit depfile"))
+                    matches!(r, RefuseReason::Unsupported(d) if d.contains("dependency-only"))
                 }),
                 "{flag} must refuse with the depfile reason"
+            );
+        }
+    }
+
+    #[test]
+    fn depgen_with_compile_needs_explicit_mf() {
+        // `-MD -MF k.d` / `-MMD -MF k.d` is the supported depinfo shape:
+        // generation mode keyed verbatim, sidecar path explicit.
+        for flag in ["-MD", "-MMD"] {
+            let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", flag, "-MF", "k.d"]);
+            assert!(
+                parsed.depgen_with_compile,
+                "{flag} must set depgen_with_compile"
+            );
+            assert!(!parsed.implicit_depfile);
+            assert_eq!(parsed.depinfo_output_path(), Some(PathBuf::from("k.d")));
+            assert!(
+                parsed.deferred_flags.iter().any(|f| f == flag),
+                "{flag} must be keyed, got {:?}",
+                parsed.deferred_flags
+            );
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{flag} with -MF must be cacheable, got {:?}",
+                parsed.refuse_reasons(&[])
+            );
+        }
+        // Without `-MF` the sidecar name would be derived: refuse.
+        for flag in ["-MD", "-MMD"] {
+            let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", flag]);
+            assert!(
+                parsed.refuse_reasons(&[]).iter().any(|r| {
+                    matches!(r, RefuseReason::Unsupported(d) if d.contains("-MF <file>"))
+                }),
+                "{flag} without -MF must refuse with the -MF reason"
             );
         }
     }
@@ -1954,6 +2053,52 @@ mod tests {
                 "must not forward {excluded:?}: {forwarded:?}"
             );
         }
+    }
+
+    #[test]
+    fn line_rule_target_shapes() {
+        // Real rule lines qualify in every spelling.
+        for rule in [
+            "kernel.o: kernel.cu\n",
+            "kernel.o : kernel.cu\n",
+            "C:\\b\\k.obj: C:\\s\\k.cu\n",
+            "C:/b/k.obj: C:/s/k.cu\n",
+            "my\\ dir/k.o: k.cu\n",
+            "   spaced.o: k.cu\n",
+        ] {
+            assert!(line_has_rule_target(rule), "{rule:?} must qualify");
+        }
+        // Prose, blanks, and colon-less lines never do — notably the
+        // `nvcc warning : ...` prologue some toolkits print on stdout.
+        // (A `word: ...` line WOULD qualify as a degenerate rule; that
+        // is safe — its tokens fail the hash and bail.)
+        for prose in [
+            "nvcc warning : Support for offline compilation\n",
+            "\n",
+            "no colon here\n",
+            ": leading colon\n",
+        ] {
+            assert!(!line_has_rule_target(prose), "{prose:?} must not qualify");
+        }
+    }
+
+    #[test]
+    fn make_deps_skips_driver_prologue() {
+        // Real CUDA 12.8 shape: a warning prologue on stdout, then the
+        // rule. Without the skip, the separator would land inside the
+        // prologue and every word of it would fail the hash.
+        let parsed = parse_nvcc_make_deps(
+            "nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed\nkernel.o : kernel.cu \\\n inc/k.h \\\n /usr/include/stdc-predef.h\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("kernel.cu"),
+                PathBuf::from("inc/k.h"),
+                PathBuf::from("/usr/include/stdc-predef.h"),
+            ]
+        );
     }
 
     #[test]
