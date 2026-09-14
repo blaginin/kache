@@ -4037,6 +4037,32 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
         return;
     };
     file_hasher.record_input_prediction(&identity, args.crate_name.as_deref(), &dep_info);
+    let normalizer = rustc_prediction_normalizer(config, args, args.path_normalization_root());
+    if let Some(portable_identity) =
+        crate::cache_key::rustc_portable_prediction_identity(args, &normalizer)
+    {
+        file_hasher.record_portable_input_prediction(
+            &portable_identity,
+            args.crate_name.as_deref(),
+            &dep_info,
+            &normalizer,
+        );
+    }
+}
+
+fn rustc_prediction_normalizer(
+    config: &Config,
+    args: &RustcArgs,
+    workspace_root: Option<&Path>,
+) -> crate::path_normalizer::PathNormalizer {
+    crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+        .with_target_dir(args.target_dir().as_deref())
+        .with_base_dirs(&config.base_dirs)
+        .with_path_only_env_vars(config.path_only_env_vars.clone())
+        .with_rust_src_rule(
+            crate::cache_key::get_rustc_sysroot(args).as_deref(),
+            crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
+        )
 }
 
 fn should_skip_cache_store_for_input_race(
@@ -4117,14 +4143,7 @@ fn compute_rustc_cache_key(
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
-    let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-        .with_target_dir(args.target_dir().as_deref())
-        .with_base_dirs(&config.base_dirs)
-        .with_path_only_env_vars(config.path_only_env_vars.clone())
-        .with_rust_src_rule(
-            crate::cache_key::get_rustc_sysroot(args).as_deref(),
-            crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
-        );
+    let path_normalizer = rustc_prediction_normalizer(config, args, workspace_root);
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,

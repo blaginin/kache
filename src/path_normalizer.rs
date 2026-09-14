@@ -613,6 +613,34 @@ impl PathNormalizer {
         Some(identity)
     }
 
+    /// Resolve a portable source identity against this invocation's roots.
+    /// A remote prediction may name only paths owned by a current remap rule;
+    /// it cannot choose an absolute path or escape a root with `..`.
+    pub(crate) fn source_path_from_identity(&self, identity: &[u8]) -> Option<PathBuf> {
+        let encoded = std::str::from_utf8(identity).ok()?;
+        let marker_end = encoded.find('>')? + 1;
+        let marker = &encoded[..marker_end];
+        let suffix = &encoded[marker_end..];
+        let relative = if suffix.is_empty() {
+            ""
+        } else {
+            suffix.strip_prefix('/')?
+        };
+        if relative
+            .split(['/', '\\'])
+            .any(|part| part == "." || part == ".." || (part.is_empty() && !relative.is_empty()))
+        {
+            return None;
+        }
+        let depinfo_marker = depinfo_sentinel_for_source(marker)?;
+        let root = self
+            .depinfo_source_roots()
+            .into_iter()
+            .find(|root| root.depinfo_sentinel == depinfo_marker)?;
+        let path = root.root.join(relative);
+        (self.source_path_identity(&path)?.as_slice() == identity).then_some(path)
+    }
+
     fn source_rule_for_path<'a>(&'a self, path: &Path) -> Option<&'a Rule> {
         let input = path.as_os_str().to_str()?;
         self.rules
@@ -2141,6 +2169,30 @@ mod tests {
         push_rule_with_variants(&mut rules, None, "<NEVER>");
         push_rule_with_variants(&mut rules, Some(String::new()), "<NEVER>");
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn source_identity_restores_under_a_different_root_without_escaping_it() {
+        let producer = TempDir::new().unwrap();
+        let consumer = TempDir::new().unwrap();
+        let producer_rules = PathNormalizer::empty()
+            .with_base_dirs(&[producer.path().to_string_lossy().into_owned()]);
+        let consumer_rules = PathNormalizer::empty()
+            .with_base_dirs(&[consumer.path().to_string_lossy().into_owned()]);
+        let source = producer.path().join("src/lib.rs");
+        let encoded = producer_rules.source_path_identity(&source).unwrap();
+        assert_eq!(
+            consumer_rules.source_path_from_identity(&encoded),
+            Some(consumer.path().join("src/lib.rs"))
+        );
+        for invalid in [
+            b"<BASE_DIR_0>/../escape".as_slice(),
+            b"<BASE_DIR_0>//escape",
+            b"<BASE_DIR_9>/src/lib.rs",
+            b"/etc/passwd",
+        ] {
+            assert_eq!(consumer_rules.source_path_from_identity(invalid), None);
+        }
     }
 
     #[test]

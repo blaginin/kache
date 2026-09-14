@@ -906,6 +906,26 @@ pub(crate) fn rustc_prediction_identity(args: &RustcArgs) -> Option<String> {
     rustc_prediction_identity_in_env(args, std::env::vars_os().collect())
 }
 
+pub(crate) fn rustc_portable_prediction_identity(
+    args: &RustcArgs,
+    normalizer: &PathNormalizer,
+) -> Option<String> {
+    let source_file = args.source_file.as_ref()?;
+    let rustc_version = get_rustc_version(&args.rustc).ok()?;
+    portable_prediction_identity_in_env(
+        &PredictionIdentityParts {
+            rustc_version: &rustc_version,
+            inner_rustc: args.inner_rustc.as_deref(),
+            current_dir: std::env::current_dir().ok().as_deref(),
+            source_file,
+            closure_args: &closure_shaping_args(source_file, &args.all_args),
+            skip_path_remap: args.skip_path_remap(),
+        },
+        std::env::vars_os().collect(),
+        normalizer,
+    )
+}
+
 fn rustc_prediction_identity_in_env(
     args: &RustcArgs,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
@@ -1015,6 +1035,7 @@ fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
 fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
+    normalizer: &PathNormalizer,
 ) -> std::result::Result<(DepInfo, String), Rejection> {
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
@@ -1022,16 +1043,40 @@ fn predicted_key_inputs(
     if !prediction_applies(&args.externs) {
         return Err(Rejection::NotEligible);
     }
-    let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
-    let record = file_hasher
-        .input_prediction(&identity)
+    let local = rustc_prediction_identity(args).and_then(|identity| {
+        file_hasher
+            .input_prediction(&identity)
+            .map(|record| (identity, record))
+    });
+    let portable = || {
+        let identity = rustc_portable_prediction_identity(args, normalizer)?;
+        let record = file_hasher.portable_input_prediction(&identity, normalizer)?;
+        Some((identity, record))
+    };
+    let (identity, dep_info) = local
+        .and_then(|(identity, record)| {
+            validate_prediction(
+                &record,
+                |path| std::fs::metadata(path).ok(),
+                |path| path.exists(),
+                |var| std::env::var(var).ok(),
+            )
+            .ok()
+            .map(|dep_info| (identity, dep_info))
+        })
+        .or_else(|| {
+            portable().and_then(|(identity, record)| {
+                validate_prediction(
+                    &record,
+                    |path| std::fs::metadata(path).ok(),
+                    |path| path.exists(),
+                    |var| std::env::var(var).ok(),
+                )
+                .ok()
+                .map(|dep_info| (identity, dep_info))
+            })
+        })
         .ok_or(Rejection::NoRecord)?;
-    let dep_info = validate_prediction(
-        &record,
-        |path| std::fs::metadata(path).ok(),
-        |path| path.exists(),
-        |var| std::env::var(var).ok(),
-    )?;
     // The identity travels with the closure: the sampled cross-check selects
     // by it, so it must be the one this record actually came from.
     Ok((dep_info, identity))
@@ -1052,10 +1097,11 @@ fn predicted_key_inputs(
 fn resolve_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
+    normalizer: &PathNormalizer,
     crate_name: &str,
 ) -> Result<Option<DepInfo>> {
     if args.source_file.is_some() {
-        match predicted_key_inputs(args, file_hasher) {
+        match predicted_key_inputs(args, file_hasher, normalizer) {
             Ok((dep_info, identity)) => {
                 let mode = parse_verify_predictions(
                     std::env::var("KACHE_VERIFY_INPUT_PREDICTIONS")
@@ -1336,7 +1382,7 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = resolve_key_inputs(args, file_hasher, crate_name)?;
+    let dep_info = resolve_key_inputs(args, file_hasher, path_normalizer, crate_name)?;
     // Keep the closure available to the wrapper, which records it as a
     // prediction only once the invocation it belongs to has succeeded. The
     // clone is one allocation per closure file against a whole rustc spawn.
@@ -2768,6 +2814,8 @@ pub struct DepInfo {
 /// entry. Precedent: `STATE_SCHEMA` / `POLICY_VERSION` in
 /// `incremental_policy.rs`.
 pub(crate) const PREDICTION_SCHEMA: u32 = 1;
+pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 2;
+pub(crate) const PORTABLE_PREDICTION_MAX_BYTES: usize = 64 * 1024;
 
 /// The input closure a previous build of one unit discovered, remembered so a
 /// later build of the same unit can skip re-discovering it.
@@ -2797,6 +2845,88 @@ impl InputPrediction {
             sources: dep_info.source_files.clone(),
             env_deps: dep_info.env_deps.clone(),
         }
+    }
+
+    /// Encode only closures whose source paths have a current remap owner.
+    /// An unmapped or non-UTF-8 path stays on the existing local-only row.
+    fn portable(&self, normalizer: &PathNormalizer) -> Option<PortableInputPrediction> {
+        let sources = self
+            .sources
+            .iter()
+            .map(|source| String::from_utf8(normalizer.source_path_identity(source)?).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let env_deps = self
+            .env_deps
+            .iter()
+            .map(|(name, value)| {
+                let encoded = if Path::new(value).is_absolute() {
+                    normalizer
+                        .source_path_identity(Path::new(value))
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .map(PortableEnvValue::Path)?
+                } else if value.is_empty() {
+                    PortableEnvValue::Empty
+                } else {
+                    // Arbitrary env-dep values may contain credentials. Keep
+                    // this closure local rather than publish them or a
+                    // guessable digest to a shared remote.
+                    return None;
+                };
+                Some((name.clone(), encoded))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(PortableInputPrediction {
+            schema: PORTABLE_PREDICTION_SCHEMA,
+            sources,
+            env_deps,
+        })
+    }
+}
+
+/// Serialized separately from the local v1 row so old local predictions stay
+/// useful even when one source cannot safely move between checkouts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PortableInputPrediction {
+    schema: u32,
+    sources: Vec<String>,
+    env_deps: Vec<(String, PortableEnvValue)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PortableEnvValue {
+    Empty,
+    Path(String),
+}
+
+impl PortableInputPrediction {
+    fn resolve(self, normalizer: &PathNormalizer) -> Option<InputPrediction> {
+        if self.schema != PORTABLE_PREDICTION_SCHEMA {
+            return None;
+        }
+        let sources = self
+            .sources
+            .iter()
+            .map(|source| normalizer.source_path_from_identity(source.as_bytes()))
+            .collect::<Option<Vec<_>>>()?;
+        let env_deps = self
+            .env_deps
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    PortableEnvValue::Empty => String::new(),
+                    PortableEnvValue::Path(path) => normalizer
+                        .source_path_from_identity(path.as_bytes())?
+                        .to_str()?
+                        .to_string(),
+                };
+                Some((name, value))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources,
+            env_deps,
+        })
     }
 }
 
@@ -3069,6 +3199,109 @@ fn prediction_identity_in_env(
         if parts.skip_path_remap { b"1" } else { b"0" },
     );
     hasher.finalize().to_hex().to_string()
+}
+
+/// A separate identity version: v1 deliberately keeps absolute paths for
+/// local rows, while v2 names only paths the current remap rules can relocate.
+fn portable_prediction_identity_in_env(
+    parts: &PredictionIdentityParts<'_>,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    normalizer: &PathNormalizer,
+) -> Option<String> {
+    let cwd = parts.current_dir?;
+    let source = if parts.source_file.is_absolute() {
+        parts.source_file.to_path_buf()
+    } else {
+        cwd.join(parts.source_file)
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-input-prediction-v2\n");
+    fold_field(
+        &mut hasher,
+        b"prediction_schema:",
+        PORTABLE_PREDICTION_SCHEMA.to_string().as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"key_version:",
+        CACHE_KEY_VERSION.to_string().as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"rustc_version:",
+        parts.rustc_version.as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"base_dir_count:",
+        normalizer
+            .configured_base_dir_count()
+            .to_string()
+            .as_bytes(),
+    );
+    let inner_rustc = match parts.inner_rustc {
+        Some(path) => Some(normalizer.normalize(path.to_str()?)),
+        None => None,
+    };
+    fold_field(
+        &mut hasher,
+        b"inner_rustc:",
+        inner_rustc.as_deref().unwrap_or_default().as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"current_dir:",
+        &normalizer.source_path_identity(cwd)?,
+    );
+    fold_field(
+        &mut hasher,
+        b"source_file:",
+        &normalizer.source_path_identity(&source)?,
+    );
+    fold_field(
+        &mut hasher,
+        b"closure_args_len:",
+        parts.closure_args.len().to_string().as_bytes(),
+    );
+    for arg in parts.closure_args {
+        fold_field(
+            &mut hasher,
+            b"closure_arg:",
+            normalizer.normalize(arg).as_bytes(),
+        );
+    }
+    let by_name: std::collections::BTreeMap<Vec<u8>, &std::ffi::OsString> = vars
+        .iter()
+        .map(|(name, value)| (env_text_key_bytes(name), value))
+        .collect();
+    for name in PREDICTION_ENV {
+        fold_field(&mut hasher, b"env_var:", name.as_bytes());
+        match by_name.get(name.as_bytes()) {
+            Some(value) => {
+                fold_field(&mut hasher, b"env_set:", b"1");
+                fold_field(
+                    &mut hasher,
+                    b"env_val:",
+                    normalizer.normalize(value.to_str()?).as_bytes(),
+                );
+            }
+            None => fold_field(&mut hasher, b"env_set:", b"0"),
+        }
+    }
+    for (name, value) in cargo_cfg_pairs(vars.iter().cloned()) {
+        fold_field(&mut hasher, b"cargo_cfg_name:", &env_text_key_bytes(&name));
+        fold_field(
+            &mut hasher,
+            b"cargo_cfg_val:",
+            normalizer.normalize(value.to_str()?).as_bytes(),
+        );
+    }
+    fold_field(
+        &mut hasher,
+        b"skip_path_remap:",
+        if parts.skip_path_remap { b"1" } else { b"0" },
+    );
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 /// Thin abstraction over file hashing.
@@ -3375,6 +3608,49 @@ impl<'db> FileHasher<'db> {
                 None
             }
         }
+    }
+
+    /// Read a portable row from the local index. The caller still validates
+    /// each named file and environment value before deriving a key.
+    pub(crate) fn portable_input_prediction(
+        &self,
+        identity: &str,
+        normalizer: &PathNormalizer,
+    ) -> Option<InputPrediction> {
+        let cache = self.cache.as_ref()?;
+        let local = cache.get_input_prediction(identity).ok().flatten();
+        let json = match local {
+            Some((PORTABLE_PREDICTION_SCHEMA, json)) => json,
+            _ => return None,
+        };
+        if json.len() > PORTABLE_PREDICTION_MAX_BYTES {
+            return None;
+        }
+        let record = serde_json::from_str::<PortableInputPrediction>(&json).ok()?;
+        let resolved = record.resolve(normalizer)?;
+        Some(resolved)
+    }
+
+    /// Keep a portable copy beside the existing local v1 record.
+    pub(crate) fn record_portable_input_prediction(
+        &self,
+        identity: &str,
+        crate_name: Option<&str>,
+        dep_info: &DepInfo,
+        normalizer: &PathNormalizer,
+    ) -> Option<String> {
+        let cache = self.cache.as_ref()?;
+        let record = InputPrediction::from_dep_info(dep_info).portable(normalizer)?;
+        let json = serde_json::to_string(&record).ok()?;
+        if json.len() > PORTABLE_PREDICTION_MAX_BYTES {
+            return None;
+        }
+        if let Err(error) =
+            cache.put_input_prediction(identity, PORTABLE_PREDICTION_SCHEMA, crate_name, &json)
+        {
+            tracing::debug!("portable input prediction record failed: {error}");
+        }
+        Some(json)
     }
 
     /// Reuse a preprocessor-output hash only when every source and header the
@@ -6305,21 +6581,22 @@ mod tests {
         ]);
 
         let off = FileHasher::persistent(&db);
+        let normalizer = PathNormalizer::empty();
         assert_eq!(
-            predicted_key_inputs(&plain, &off),
+            predicted_key_inputs(&plain, &off, &normalizer),
             Err(Rejection::Disabled),
             "predictions off must not touch the table"
         );
 
         let on = FileHasher::persistent(&db).with_input_predictions(true);
         assert_eq!(
-            predicted_key_inputs(&with_macro, &on),
+            predicted_key_inputs(&with_macro, &on, &normalizer),
             Err(Rejection::NotEligible),
             "a proc-macro dependency is refused before any lookup"
         );
         if get_rustc_version(Path::new("rustc")).is_ok() {
             assert_eq!(
-                predicted_key_inputs(&plain, &on),
+                predicted_key_inputs(&plain, &on, &normalizer),
                 Err(Rejection::NoRecord),
                 "an eligible invocation with nothing recorded falls back"
             );
@@ -6728,6 +7005,95 @@ mod tests {
             prediction_identity_in_env(&base_parts, base_env(&[("PWD", "/somewhere/else")])),
             base,
             "variables that do not change what rustc reads must not be folded"
+        );
+    }
+
+    #[test]
+    fn portable_prediction_moves_identity_and_closure_between_roots() {
+        let producer = tempfile::TempDir::new().unwrap();
+        let consumer = tempfile::TempDir::new().unwrap();
+        let producer_rules = PathNormalizer::empty()
+            .with_base_dirs(&[producer.path().to_string_lossy().into_owned()]);
+        let consumer_rules = PathNormalizer::empty()
+            .with_base_dirs(&[consumer.path().to_string_lossy().into_owned()]);
+        let args_for = |root: &Path| {
+            vec![format!(
+                "--extern=dep={}/target/libdep.rlib",
+                root.display()
+            )]
+        };
+        let producer_args = args_for(producer.path());
+        let consumer_args = args_for(consumer.path());
+        let producer_parts = PredictionIdentityParts {
+            rustc_version: "rustc 1.98.0",
+            inner_rustc: None,
+            current_dir: Some(producer.path()),
+            source_file: Path::new("src/lib.rs"),
+            closure_args: &producer_args,
+            skip_path_remap: false,
+        };
+        let consumer_parts = PredictionIdentityParts {
+            current_dir: Some(consumer.path()),
+            closure_args: &consumer_args,
+            ..producer_parts
+        };
+        let env_for = |root: &Path| {
+            vec![(
+                std::ffi::OsString::from("OUT_DIR"),
+                root.join("target/build/out").into_os_string(),
+            )]
+        };
+        assert_eq!(
+            portable_prediction_identity_in_env(
+                &producer_parts,
+                env_for(producer.path()),
+                &producer_rules,
+            ),
+            portable_prediction_identity_in_env(
+                &consumer_parts,
+                env_for(consumer.path()),
+                &consumer_rules,
+            )
+        );
+        assert_ne!(
+            prediction_identity_in_env(&producer_parts, env_for(producer.path())),
+            prediction_identity_in_env(&consumer_parts, env_for(consumer.path()))
+        );
+        let record = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![
+                producer.path().join("src/lib.rs"),
+                producer.path().join("src/other.rs"),
+            ],
+            env_deps: vec![(
+                "OUT_DIR".to_string(),
+                producer
+                    .path()
+                    .join("target/build/out")
+                    .display()
+                    .to_string(),
+            )],
+        };
+        let portable = record.portable(&producer_rules).unwrap();
+        let restored = portable.resolve(&consumer_rules).unwrap();
+        assert_eq!(restored.sources[0], consumer.path().join("src/lib.rs"));
+        assert_eq!(restored.sources[1], consumer.path().join("src/other.rs"));
+        assert_eq!(
+            restored.env_deps[0].1,
+            consumer
+                .path()
+                .join("target/build/out")
+                .display()
+                .to_string()
+        );
+
+        let mut unsafe_record = record;
+        unsafe_record
+            .env_deps
+            .push(("TOKEN".into(), "private-value".into()));
+        assert!(
+            unsafe_record.portable(&producer_rules).is_none(),
+            "arbitrary environment values must stay in the local v1 row"
         );
     }
 
