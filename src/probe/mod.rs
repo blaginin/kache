@@ -649,7 +649,13 @@ pub enum LiveProbeDiagnostic {
 /// record may hold `resolved_tokens: None` from before a toolchain change,
 /// and doctor's job is to report what the compiler does NOW (#626).
 pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
-    live_probe_diagnostic_for("cc")
+    // A `cc` shim may route `-###` through Kache's fallback wrapper (such as
+    // sccache), which expects an object that the dry run never creates. Probe
+    // the compiler Kache actually invokes behind the shim.
+    match crate::compiler::shim::resolve_real_compiler_from_env("cc") {
+        Some(compiler) => live_probe_diagnostic_for(&compiler.to_string_lossy()),
+        None => live_probe_diagnostic_for("cc"),
+    }
 }
 
 /// [`live_probe_diagnostic`] against an explicit compiler, so the
@@ -955,6 +961,56 @@ mod tests {
                 panic!("a working host `cc` must not classify as ProbeError: {detail}")
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_doctor_probe_skips_a_kache_cc_shim() {
+        use std::os::unix::fs::symlink;
+
+        if let Some(expected) = std::env::var_os("KACHE_DOCTOR_SHIM_TEST_CHILD") {
+            match live_probe_diagnostic() {
+                LiveProbeDiagnostic::Resolved { version_line } => {
+                    assert_eq!(version_line, expected.to_string_lossy())
+                }
+                other => panic!("doctor must probe the compiler behind the shim: {other:?}"),
+            }
+            return;
+        }
+
+        let _lock = crate::config::config_path_lock();
+        let Some(real_cc) = crate::compiler::shim::resolve_real_compiler_from_env("cc") else {
+            eprintln!("skipping: no real `cc` on PATH");
+            return;
+        };
+        let LiveProbeDiagnostic::Resolved { version_line } =
+            live_probe_diagnostic_for(&real_cc.to_string_lossy())
+        else {
+            eprintln!("skipping: host `cc` has no resolved compile line");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        symlink(&exe, dir.path().join("cc")).unwrap();
+        let original_path = std::env::var_os("PATH").unwrap();
+        let mut dirs = vec![dir.path().to_path_buf()];
+        dirs.extend(std::env::split_paths(&original_path));
+        let output = Command::new(exe)
+            .args([
+                "--exact",
+                "probe::tests::live_doctor_probe_skips_a_kache_cc_shim",
+            ])
+            .env("PATH", std::env::join_paths(dirs).unwrap())
+            .env("KACHE_DOCTOR_SHIM_TEST_CHILD", version_line)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
