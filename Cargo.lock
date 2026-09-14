@@ -2024,6 +2024,7 @@ dependencies = [
  "reqsign-aws-v4",
  "reqsign-core",
  "reqwest 0.13.5",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

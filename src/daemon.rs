@@ -396,6 +396,11 @@ pub(crate) enum Request {
     /// mutation, closing the capability-probe/replacement race.
     GcV2(GcRequest),
     RemoteCheck(RemoteCheckRequest),
+    RemotePredictionGet(String),
+    RemotePredictionPut {
+        id: String,
+        encrypted: Vec<u8>,
+    },
     Stats(StatsRequest),
     BatchRemoteCheck(BatchRemoteCheckRequest),
     HashFiles(HashFilesRequest),
@@ -1478,6 +1483,8 @@ pub(crate) struct Response {
     /// Reply payload for `Request::LocalLookup` (kunobi-ninja/kache#565).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_lookup: Option<LocalLookupReply>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction_bytes: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1499,6 +1506,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1516,6 +1524,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1540,6 +1549,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1556,6 +1566,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1572,6 +1583,7 @@ impl Response {
             batch_results: Some(results),
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1588,6 +1600,7 @@ impl Response {
             batch_results: None,
             hash_results: Some(results),
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1604,6 +1617,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1620,6 +1634,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: None,
         }
     }
@@ -1643,6 +1658,7 @@ impl Response {
             batch_results: None,
             hash_results: None,
             local_lookup: None,
+            prediction_bytes: None,
             error: Some(msg.into()),
         }
     }
@@ -2855,6 +2871,67 @@ impl Daemon {
             .await
     }
 
+    async fn handle_remote_prediction_get(&self, id: &str) -> Response {
+        if !crate::cache_key::is_valid_cache_key(id) {
+            return Response::err("invalid prediction id");
+        }
+        let Some(remote) = &self.config.remote else {
+            return Response::err("no remote configured");
+        };
+        let object_key =
+            crate::config::join_remote_key(&remote.prefix, &format!("_predictions/v1/{id}.bin"));
+        let read = async {
+            self.get_remote_backend()
+                .await?
+                .get(
+                    &object_key,
+                    Some(crate::cache_key::REMOTE_PREDICTION_MAX_BYTES as u64),
+                )
+                .await
+        };
+        match tokio::time::timeout(Duration::from_secs(2), read).await {
+            Ok(Ok(Some(object))) => Response {
+                prediction_bytes: Some(object.body.to_vec()),
+                ..Response::ok()
+            },
+            Ok(Ok(None)) => Response::ok(),
+            Ok(Err(error)) => Response::err(format!("prediction read failed: {error}")),
+            Err(_) => Response::err("prediction read timed out"),
+        }
+    }
+
+    async fn handle_remote_prediction_put(&self, id: &str, encrypted: &[u8]) -> Response {
+        if !crate::cache_key::is_valid_cache_key(id)
+            || encrypted.len() < 29
+            || encrypted.len() > crate::cache_key::REMOTE_PREDICTION_MAX_BYTES
+        {
+            return Response::err("invalid encrypted prediction");
+        }
+        if self.config.remote_readonly {
+            return Response::ok();
+        }
+        let Some(remote) = &self.config.remote else {
+            return Response::err("no remote configured");
+        };
+        let object_key =
+            crate::config::join_remote_key(&remote.prefix, &format!("_predictions/v1/{id}.bin"));
+        let write = async {
+            self.get_remote_backend()
+                .await?
+                .put(
+                    &object_key,
+                    encrypted.to_vec(),
+                    Some("application/octet-stream"),
+                )
+                .await
+        };
+        match tokio::time::timeout(Duration::from_secs(3), write).await {
+            Ok(Ok(())) => Response::ok(),
+            Ok(Err(error)) => Response::err(format!("prediction write failed: {error}")),
+            Err(_) => Response::err("prediction write timed out"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_remote_backend_for_test(
         &self,
@@ -2877,6 +2954,8 @@ impl Daemon {
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
             | Request::RemoteCheck(_)
+            | Request::RemotePredictionGet(_)
+            | Request::RemotePredictionPut { .. }
             | Request::BatchRemoteCheck(_)
             | Request::LocalLookup(_)
             | Request::Prefetch(_)
@@ -7372,6 +7451,10 @@ async fn handle_connection_started_at(
                     .handle_remote_check_started_at(&req, request_started_at)
                     .await
             }
+            Ok(Request::RemotePredictionGet(id)) => daemon.handle_remote_prediction_get(&id).await,
+            Ok(Request::RemotePredictionPut { id, encrypted }) => {
+                daemon.handle_remote_prediction_put(&id, &encrypted).await
+            }
             Ok(Request::LocalLookup(req)) => daemon.handle_local_lookup(&req).await,
             Ok(Request::Stats(req)) => {
                 let d = Arc::clone(daemon);
@@ -7725,6 +7808,29 @@ pub fn send_remote_check(
             tracing::debug!("remote check: daemon unreachable ({e})");
             None
         }
+    }
+}
+
+/// Best-effort encrypted prediction lookup on the first build of a unit.
+pub(crate) fn send_remote_prediction_get(socket: &Path, id: &str) -> Option<Vec<u8>> {
+    if !crate::transport::is_reachable(socket) {
+        return None;
+    }
+    let request = Request::RemotePredictionGet(id.to_string());
+    let line = send_request_with_timeout(socket, &request, Duration::from_millis(2200)).ok()?;
+    let response: Response = serde_json::from_str(&line).ok()?;
+    response.ok.then_some(response.prediction_bytes).flatten()
+}
+
+/// The daemon receives only ciphertext; source names and the shared key stay
+/// in the compiler-wrapper process.
+pub(crate) fn send_remote_prediction_put(socket: &Path, id: &str, encrypted: Vec<u8>) {
+    let request = Request::RemotePredictionPut {
+        id: id.to_string(),
+        encrypted,
+    };
+    if let Err(error) = send_request_fire_and_forget(socket, &request) {
+        tracing::debug!("remote prediction publish skipped: {error}");
     }
 }
 
@@ -13642,6 +13748,91 @@ mod tests {
 
     fn test_remote_backend() -> Arc<dyn crate::remote_backend::RemoteBackend> {
         Arc::new(crate::remote_backend::memory_backend())
+    }
+
+    #[tokio::test]
+    async fn encrypted_prediction_round_trips_and_readonly_blocks_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Daemon::new(config.clone());
+        daemon.set_remote_backend_for_test(backend.clone());
+        let id = "a".repeat(64);
+        let encrypted = vec![1; 29];
+        assert!(
+            daemon
+                .handle_remote_prediction_put(&id, &encrypted)
+                .await
+                .ok
+        );
+        let response = daemon.handle_remote_prediction_get(&id).await;
+        assert_eq!(response.prediction_bytes, Some(encrypted));
+        assert!(
+            !daemon
+                .handle_remote_prediction_put("../escape", &[1; 29])
+                .await
+                .ok
+        );
+
+        config.remote_readonly = true;
+        let readonly = Daemon::new(config);
+        readonly.set_remote_backend_for_test(backend);
+        let other_id = "b".repeat(64);
+        assert!(
+            readonly
+                .handle_remote_prediction_put(&other_id, &[1; 29])
+                .await
+                .ok
+        );
+        assert_eq!(
+            readonly
+                .handle_remote_prediction_get(&other_id)
+                .await
+                .prediction_bytes,
+            None
+        );
+        assert_eq!(
+            readonly
+                .handle_remote_prediction_get(&id)
+                .await
+                .prediction_bytes,
+            Some(vec![1; 29])
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_prediction_client_gets_daemon_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let socket = config.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = bind_listener(&socket);
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(test_remote_backend());
+        let id = "c".repeat(64);
+        let encrypted = vec![2; 29];
+        assert!(
+            daemon
+                .handle_remote_prediction_put(&id, &encrypted)
+                .await
+                .ok
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("accept");
+                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+                    .await
+                    .expect("handle_connection");
+            }
+        });
+        let received =
+            tokio::task::spawn_blocking(move || send_remote_prediction_get(&socket, &id))
+                .await
+                .unwrap();
+        server.abort();
+        assert_eq!(received, Some(encrypted));
     }
 
     struct BlockingIdentityBackend {

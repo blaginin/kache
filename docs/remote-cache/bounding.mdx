@@ -11,18 +11,20 @@ A remote cache grows until something removes old objects. That something is the 
 {prefix}/v3/manifests/{crate}/{key}.json      one manifest ...
 {prefix}/v3/packs/{crate}/{key}.tar.zst       ... and the pack it describes
 {prefix}/_manifests/...                       build manifests and shards
+{prefix}/_predictions/v1/{id}.bin             encrypted input predictions
 {prefix}/v4/prefetch/catalogs/...             prefetch catalogs
 {prefix}/v4/prefetch/packs/...                content-addressed prefetch packs
 {prefix}/v4/prefetch/pack-meta/...            metadata for those packs
 ```
 
-Three rules keep the store consistent under expiry:
+These rules keep the store consistent under expiry:
 
 - Expire `v3/manifests/` and `v3/packs/` with the same age. A manifest and its pack are written together and neither is rewritten, so they age together. A manifest that outlives its pack is a miss; a pack that outlives its manifest is unreachable garbage.
 - Expire `v4/prefetch/catalogs/` sooner than `v4/prefetch/packs/` and `pack-meta/`. Packs are shared between catalog generations, so a live catalog must never point at an expired pack.
-- Expire by age since the object was written. kache does not rewrite an existing object, so a hot entry expires too and is uploaded again on the next miss. That is the same trade every object store's lifecycle makes; pick an age longer than the interval at which your builds change.
+- Expire artifacts by age since they were written. Artifact objects are immutable, so a hot entry expires too and is uploaded again on the next miss. Pick an age longer than the interval at which your builds change.
+- Expire `_predictions/` independently. Losing a prediction runs the dep-info pre-pass; it does not invalidate an artifact.
 
-An expired object is a miss. The daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
+An expired artifact is a miss. The daemon's remote key index can report it present for up to `cache.remote_key_cache_refresh_secs` after expiry; the fetch then misses and the crate compiles as usual. An expired prediction only brings back the dep-info pre-pass.
 
 ## S3 lifecycle rules
 
@@ -35,6 +37,7 @@ Thirty days for artifacts and fourteen for catalogs is a reasonable start. Every
   "Rules": [
     { "ID": "kache-v3", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v3/" }, "Expiration": { "Days": 30 } },
     { "ID": "kache-manifests", "Status": "Enabled", "Filter": { "Prefix": "artifacts/_manifests/" }, "Expiration": { "Days": 30 } },
+    { "ID": "kache-predictions", "Status": "Enabled", "Filter": { "Prefix": "artifacts/_predictions/" }, "Expiration": { "Days": 30 } },
     { "ID": "kache-prefetch-catalogs", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/catalogs/" }, "Expiration": { "Days": 14 } },
     { "ID": "kache-prefetch-packs", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/packs/" }, "Expiration": { "Days": 30 } },
     { "ID": "kache-prefetch-pack-meta", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/pack-meta/" }, "Expiration": { "Days": 30 } }
@@ -57,6 +60,7 @@ R2 supports object lifecycle rules per prefix with the same expiry-by-age semant
 ```bash
 mc ilm rule add --prefix "artifacts/v3/" --expire-days 30 myminio/my-kache
 mc ilm rule add --prefix "artifacts/_manifests/" --expire-days 30 myminio/my-kache
+mc ilm rule add --prefix "artifacts/_predictions/" --expire-days 30 myminio/my-kache
 mc ilm rule add --prefix "artifacts/v4/prefetch/catalogs/" --expire-days 14 myminio/my-kache
 mc ilm rule add --prefix "artifacts/v4/prefetch/packs/" --expire-days 30 myminio/my-kache
 mc ilm rule add --prefix "artifacts/v4/prefetch/pack-meta/" --expire-days 30 myminio/my-kache
@@ -71,6 +75,7 @@ The owner of the shared directory runs one prune job on one machine. Age by modi
 root=/mnt/shared-kache/artifacts
 # v3: manifests and packs in one pass, same age, so pairs go together.
 find "$root/v3" "$root/_manifests" -type f -mtime +30 -delete
+[ ! -d "$root/_predictions" ] || find "$root/_predictions" -type f -mtime +30 -delete
 # v4: catalogs before the packs they reference.
 find "$root/v4/prefetch/catalogs" -type f -mtime +14 -delete
 find "$root/v4/prefetch/packs" "$root/v4/prefetch/pack-meta" -type f -mtime +30 -delete

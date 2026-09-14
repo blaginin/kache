@@ -117,6 +117,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
 | `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `false` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
+| `KACHE_REMOTE_PREDICTION_KEY` | none | unset | With `input_predictions` enabled, share rows through the configured remote. Set the same 64-character hex key on each trusted builder. Kache encrypts source paths and uses keyed object names; without the key, predictions stay local. Rows with arbitrary environment values stay local. Keep this key out of untrusted CI jobs. |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
 | none | `cache.bypass_crates` | `[]` | Exact rustc crate names that bypass Kache |
@@ -213,6 +214,8 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
 
 Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, the selected AWS profile, web identity, container credentials, then instance credentials.
+
+Generate a remote prediction key with `openssl rand -hex 32`. Store it as a secret and give the same value only to builders that should share source-closure metadata.
 
 See [S3 setup](/docs/remote-cache/s3-setup) or [filesystem setup](/docs/remote-cache/filesystem-setup).
 

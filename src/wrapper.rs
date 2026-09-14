@@ -4041,12 +4041,24 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     if let Some(portable_identity) =
         crate::cache_key::rustc_portable_prediction_identity(args, &normalizer)
     {
-        file_hasher.record_portable_input_prediction(
+        let json = file_hasher.record_portable_input_prediction(
             &portable_identity,
             args.crate_name.as_deref(),
             &dep_info,
             &normalizer,
         );
+        if config.remote.is_some()
+            && !config.remote_readonly
+            && let (Some(key), Some(json)) =
+                (crate::cache_key::RemotePredictionKey::from_env(), json)
+            && let Some(encrypted) = key.seal(&portable_identity, &json)
+        {
+            crate::daemon::send_remote_prediction_put(
+                &config.socket_path(),
+                &key.remote_id(&portable_identity),
+                encrypted,
+            );
+        }
     }
 }
 
@@ -4128,7 +4140,8 @@ fn compute_rustc_cache_key(
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
-    .with_input_predictions(config.input_predictions);
+    .with_input_predictions(config.input_predictions)
+    .with_remote_predictions(config.remote.is_some());
     if config.modified_input_guard {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look

@@ -2816,6 +2816,89 @@ pub struct DepInfo {
 pub(crate) const PREDICTION_SCHEMA: u32 = 1;
 pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 2;
 pub(crate) const PORTABLE_PREDICTION_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const REMOTE_PREDICTION_MAX_BYTES: usize = PORTABLE_PREDICTION_MAX_BYTES + 29;
+
+/// The remote never receives the closure or a reversible unit identity.
+/// Operators share this 256-bit key between wrappers that may exchange rows.
+pub(crate) struct RemotePredictionKey([u8; 32]);
+
+impl RemotePredictionKey {
+    pub(crate) fn from_env() -> Option<Self> {
+        let value = std::env::var("KACHE_REMOTE_PREDICTION_KEY").ok()?;
+        let parsed = Self::from_hex(&value);
+        if parsed.is_none() {
+            tracing::warn!(
+                "KACHE_REMOTE_PREDICTION_KEY must be 64 hex characters; remote predictions disabled"
+            );
+        }
+        parsed
+    }
+
+    fn from_hex(value: &str) -> Option<Self> {
+        if value.len() != 64 {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[2 * index..2 * index + 2], 16).ok()?;
+        }
+        Some(Self(key))
+    }
+
+    pub(crate) fn remote_id(&self, identity: &str) -> String {
+        let mut input = b"kache-remote-prediction-id-v1\0".to_vec();
+        input.extend_from_slice(identity.as_bytes());
+        blake3::keyed_hash(&self.0, &input).to_hex().to_string()
+    }
+
+    fn aead_key(&self) -> Option<ring::aead::LessSafeKey> {
+        let key = blake3::keyed_hash(&self.0, b"kache-remote-prediction-aead-v1");
+        let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key.as_bytes()).ok()?;
+        Some(ring::aead::LessSafeKey::new(unbound))
+    }
+
+    pub(crate) fn seal(&self, identity: &str, json: &str) -> Option<Vec<u8>> {
+        if json.len() > PORTABLE_PREDICTION_MAX_BYTES {
+            return None;
+        }
+        use ring::rand::SecureRandom;
+        let mut nonce = [0u8; 12];
+        ring::rand::SystemRandom::new().fill(&mut nonce).ok()?;
+        let mut body = json.as_bytes().to_vec();
+        self.aead_key()?
+            .seal_in_place_append_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::from(identity.as_bytes()),
+                &mut body,
+            )
+            .ok()?;
+        let mut result = Vec::with_capacity(1 + nonce.len() + body.len());
+        result.push(1);
+        result.extend_from_slice(&nonce);
+        result.extend_from_slice(&body);
+        Some(result)
+    }
+
+    pub(crate) fn open(&self, identity: &str, encrypted: &[u8]) -> Option<String> {
+        if encrypted.len() < 29
+            || encrypted.len() > REMOTE_PREDICTION_MAX_BYTES
+            || encrypted[0] != 1
+        {
+            return None;
+        }
+        let nonce: [u8; 12] = encrypted[1..13].try_into().ok()?;
+        let mut body = encrypted[13..].to_vec();
+        let plaintext = self
+            .aead_key()?
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::from(identity.as_bytes()),
+                &mut body,
+            )
+            .ok()?;
+        String::from_utf8(plaintext.to_vec()).ok()
+    }
+}
 
 /// The input closure a previous build of one unit discovered, remembered so a
 /// later build of the same unit can skip re-discovering it.
@@ -2849,11 +2932,26 @@ impl InputPrediction {
 
     /// Encode only closures whose source paths have a current remap owner.
     /// An unmapped or non-UTF-8 path stays on the existing local-only row.
-    fn portable(&self, normalizer: &PathNormalizer) -> Option<PortableInputPrediction> {
+    fn portable(&self, normalizer: &PathNormalizer, cwd: &Path) -> Option<PortableInputPrediction> {
         let sources = self
             .sources
             .iter()
-            .map(|source| String::from_utf8(normalizer.source_path_identity(source)?).ok())
+            .map(|source| {
+                let relative = if source.is_absolute() {
+                    None
+                } else {
+                    Some(source.to_str()?.to_string())
+                };
+                let absolute = match &relative {
+                    Some(_) => cwd.join(clean_relative_source(source)?),
+                    None => source.to_path_buf(),
+                };
+                Some(PortableSource {
+                    identity: String::from_utf8(normalizer.source_path_identity(&absolute)?)
+                        .ok()?,
+                    relative,
+                })
+            })
             .collect::<Option<Vec<_>>>()?;
         let env_deps = self
             .env_deps
@@ -2888,8 +2986,26 @@ impl InputPrediction {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PortableInputPrediction {
     schema: u32,
-    sources: Vec<String>,
+    sources: Vec<PortableSource>,
     env_deps: Vec<(String, PortableEnvValue)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PortableSource {
+    identity: String,
+    relative: Option<String>,
+}
+
+fn clean_relative_source(source: &Path) -> Option<PathBuf> {
+    let mut clean = PathBuf::new();
+    for part in source.components() {
+        match part {
+            std::path::Component::Normal(name) => clean.push(name),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!clean.as_os_str().is_empty()).then_some(clean)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2899,14 +3015,27 @@ enum PortableEnvValue {
 }
 
 impl PortableInputPrediction {
-    fn resolve(self, normalizer: &PathNormalizer) -> Option<InputPrediction> {
+    fn resolve(self, normalizer: &PathNormalizer, cwd: &Path) -> Option<InputPrediction> {
         if self.schema != PORTABLE_PREDICTION_SCHEMA {
             return None;
         }
         let sources = self
             .sources
             .iter()
-            .map(|source| normalizer.source_path_from_identity(source.as_bytes()))
+            .map(|source| {
+                let absolute = normalizer.source_path_from_identity(source.identity.as_bytes())?;
+                if let Some(relative) = &source.relative {
+                    let spelling = PathBuf::from(relative);
+                    let clean = clean_relative_source(&spelling)?;
+                    (normalizer
+                        .source_path_identity(&cwd.join(clean))?
+                        .as_slice()
+                        == source.identity.as_bytes())
+                    .then_some(spelling)
+                } else {
+                    Some(absolute)
+                }
+            })
             .collect::<Option<Vec<_>>>()?;
         let env_deps = self
             .env_deps
@@ -3314,6 +3443,7 @@ pub struct FileHasher<'db> {
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
     use_input_predictions: bool,
+    use_remote_predictions: bool,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
     runtime_env_uses: RefCell<HashMap<(String, String), bool>>,
@@ -3413,6 +3543,7 @@ impl FileHasher<'static> {
             cache: None,
             daemon_socket: None,
             use_input_predictions: false,
+            use_remote_predictions: false,
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
             runtime_env_uses: RefCell::new(HashMap::new()),
@@ -3429,6 +3560,7 @@ impl FileHasher<'static> {
                 cache: Some(cache),
                 daemon_socket: None,
                 use_input_predictions: false,
+                use_remote_predictions: false,
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
                 runtime_env_uses: RefCell::new(HashMap::new()),
@@ -3453,6 +3585,7 @@ impl<'db> FileHasher<'db> {
             cache: Some(cache),
             daemon_socket: None,
             use_input_predictions: false,
+            use_remote_predictions: false,
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
             runtime_env_uses: RefCell::new(HashMap::new()),
@@ -3475,6 +3608,11 @@ impl<'db> FileHasher<'db> {
     /// asking is always allowed to answer "run the pre-pass".
     pub(crate) fn with_input_predictions(mut self, enabled: bool) -> Self {
         self.use_input_predictions = enabled;
+        self
+    }
+
+    pub(crate) fn with_remote_predictions(mut self, enabled: bool) -> Self {
+        self.use_remote_predictions = enabled;
         self
     }
 
@@ -3610,7 +3748,7 @@ impl<'db> FileHasher<'db> {
         }
     }
 
-    /// Read a portable row from the local index. The caller still validates
+    /// Read a portable row locally or from the encrypted remote. The caller validates
     /// each named file and environment value before deriving a key.
     pub(crate) fn portable_input_prediction(
         &self,
@@ -3619,15 +3757,30 @@ impl<'db> FileHasher<'db> {
     ) -> Option<InputPrediction> {
         let cache = self.cache.as_ref()?;
         let local = cache.get_input_prediction(identity).ok().flatten();
+        let from_remote = local.is_none();
         let json = match local {
             Some((PORTABLE_PREDICTION_SCHEMA, json)) => json,
-            _ => return None,
+            Some(_) => return None,
+            None => {
+                if !self.use_remote_predictions {
+                    return None;
+                }
+                let socket = self.daemon_socket.as_ref()?;
+                let key = RemotePredictionKey::from_env()?;
+                let remote_id = key.remote_id(identity);
+                let encrypted = crate::daemon::send_remote_prediction_get(socket, &remote_id)?;
+                key.open(identity, &encrypted)?
+            }
         };
         if json.len() > PORTABLE_PREDICTION_MAX_BYTES {
             return None;
         }
         let record = serde_json::from_str::<PortableInputPrediction>(&json).ok()?;
-        let resolved = record.resolve(normalizer)?;
+        let cwd = std::env::current_dir().ok()?;
+        let resolved = record.resolve(normalizer, &cwd)?;
+        if from_remote {
+            let _ = cache.put_input_prediction(identity, PORTABLE_PREDICTION_SCHEMA, None, &json);
+        }
         Some(resolved)
     }
 
@@ -3640,7 +3793,8 @@ impl<'db> FileHasher<'db> {
         normalizer: &PathNormalizer,
     ) -> Option<String> {
         let cache = self.cache.as_ref()?;
-        let record = InputPrediction::from_dep_info(dep_info).portable(normalizer)?;
+        let cwd = std::env::current_dir().ok()?;
+        let record = InputPrediction::from_dep_info(dep_info).portable(normalizer, &cwd)?;
         let json = serde_json::to_string(&record).ok()?;
         if json.len() > PORTABLE_PREDICTION_MAX_BYTES {
             return None;
@@ -7074,8 +7228,8 @@ mod tests {
                     .to_string(),
             )],
         };
-        let portable = record.portable(&producer_rules).unwrap();
-        let restored = portable.resolve(&consumer_rules).unwrap();
+        let portable = record.portable(&producer_rules, producer.path()).unwrap();
+        let restored = portable.resolve(&consumer_rules, consumer.path()).unwrap();
         assert_eq!(restored.sources[0], consumer.path().join("src/lib.rs"));
         assert_eq!(restored.sources[1], consumer.path().join("src/other.rs"));
         assert_eq!(
@@ -7092,9 +7246,58 @@ mod tests {
             .env_deps
             .push(("TOKEN".into(), "private-value".into()));
         assert!(
-            unsafe_record.portable(&producer_rules).is_none(),
+            unsafe_record
+                .portable(&producer_rules, producer.path())
+                .is_none(),
             "arbitrary environment values must stay in the local v1 row"
         );
+
+        let relative = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![PathBuf::from("./src/lib.rs")],
+            env_deps: Vec::new(),
+        };
+        let encoded = relative.portable(&producer_rules, producer.path()).unwrap();
+        assert_eq!(
+            encoded
+                .resolve(&consumer_rules, consumer.path())
+                .unwrap()
+                .sources,
+            relative.sources
+        );
+        let escape = InputPrediction {
+            sources: vec![PathBuf::from("../outside.rs")],
+            ..relative
+        };
+        assert!(escape.portable(&producer_rules, producer.path()).is_none());
+    }
+
+    #[test]
+    fn remote_prediction_payload_hides_paths_and_rejects_wrong_keys() {
+        assert!(RemotePredictionKey::from_hex("abc").is_none());
+        assert!(RemotePredictionKey::from_hex(&"g".repeat(64)).is_none());
+        assert_eq!(
+            RemotePredictionKey::from_hex(&"07".repeat(32)).unwrap().0,
+            [7; 32]
+        );
+        let first = RemotePredictionKey([7; 32]);
+        let other = RemotePredictionKey([8; 32]);
+        let identity = "a".repeat(64);
+        let json = r#"{"sources":["<WORKSPACE>/src/private.rs"]}"#;
+        let sealed = first.seal(&identity, json).unwrap();
+        assert_eq!(first.open(&identity, &sealed).as_deref(), Some(json));
+        assert_ne!(first.remote_id(&identity), other.remote_id(&identity));
+        assert_ne!(sealed, first.seal(&identity, json).unwrap());
+        assert!(other.open(&identity, &sealed).is_none());
+        assert!(first.open(&"b".repeat(64), &sealed).is_none());
+        assert!(
+            !sealed
+                .windows(b"private.rs".len())
+                .any(|part| part == b"private.rs")
+        );
+        let mut tampered = sealed;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(first.open(&identity, &tampered).is_none());
     }
 
     /// An invocation with no crate root discovers no closure, so it has no

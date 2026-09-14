@@ -38,6 +38,7 @@ resolver = "3"
 kache-format = { version = "0.22.0", path = "crates/kache-format" }
 kache-store = { version = "0.22.0", path = "crates/kache-store" }
 blake3 = "1"
+ring = "0.17"
 bytes = "1"
 # OpenDAL 0.58 publishes its modules as separate crates. Depending on only the
 # core, S3, filesystem, retry, and reqwest transport modules keeps Kache's

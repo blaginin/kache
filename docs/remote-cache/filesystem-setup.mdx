@@ -46,7 +46,8 @@ Kache rejects a configuration that cannot provide atomic final renames.
 └── artifacts/
     ├── v3/manifests/{crate}/{key}.json
     ├── v3/packs/{crate}/{key}.tar.zst
-    └── _manifests/
+    ├── _manifests/
+    └── _predictions/v1/{opaque-id}.bin
 ```
 
 Filesystem prefixes cannot contain `:`.

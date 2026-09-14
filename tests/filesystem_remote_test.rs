@@ -45,6 +45,7 @@ struct Client {
     runtime_dir: PathBuf,
     config_path: PathBuf,
     command_seq: AtomicUsize,
+    prediction_key: Option<&'static str>,
 }
 
 impl Client {
@@ -73,6 +74,13 @@ impl Client {
             config.replace("[cache]\n", "[cache]\ninput_predictions = true\n"),
         )
         .unwrap();
+        client
+    }
+
+    fn with_encrypted_predictions(shared_folder: &Path) -> Self {
+        let mut client = Self::with_predictions(shared_folder);
+        client.prediction_key =
+            Some("0707070707070707070707070707070707070707070707070707070707070707");
         client
     }
 
@@ -108,6 +116,7 @@ impl Client {
             runtime_dir,
             config_path,
             command_seq: AtomicUsize::new(0),
+            prediction_key: None,
         }
     }
 
@@ -127,6 +136,7 @@ impl Client {
             .env_remove("KACHE_NAMESPACE")
             .env_remove("KACHE_BASE_DIR")
             .env_remove("KACHE_SOCKET_PATH")
+            .env_remove("KACHE_REMOTE_PREDICTION_KEY")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
             // These tests publish to a hermetic filesystem remote. CI runners
@@ -135,6 +145,9 @@ impl Client {
             .env_remove("GITHUB_ACTIONS")
             .env_remove("GITLAB_CI")
             .env_remove("CI");
+        if let Some(key) = self.prediction_key {
+            cmd.env("KACHE_REMOTE_PREDICTION_KEY", key);
+        }
         cmd
     }
 
@@ -545,6 +558,64 @@ fn a_predicted_key_reaches_the_remote_without_a_pre_pass() {
     );
 
     client.stop_daemon_and_wait();
+}
+
+#[test]
+fn encrypted_prediction_skips_the_pre_pass_in_a_fresh_checkout() {
+    build_kache();
+
+    let shared = TempDir::new().unwrap();
+    let producer_source = TempDir::new().unwrap();
+    let consumer_source = TempDir::new().unwrap();
+    for checkout in [&producer_source, &consumer_source] {
+        std::fs::write(
+            checkout.path().join("lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+    }
+
+    let alpha = Client::with_encrypted_predictions(shared.path());
+    let out_a = TempDir::new().unwrap();
+    alpha.start_daemon();
+    alpha.compile_checkout(producer_source.path(), out_a.path());
+    let cold = crate_event(&alpha.report(), "fsremote").clone();
+    assert_eq!(cold["dep_info_runs"], 1, "{cold}");
+    wait_for_remote_entry(
+        shared.path(),
+        "fsremote",
+        cold["cache_key"].as_str().unwrap(),
+    );
+
+    let prediction_dir = shared.path().join("artifacts/_predictions/v1");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let prediction_file = loop {
+        let mut files = Vec::new();
+        collect_files(&prediction_dir, &mut files);
+        if let Some(file) = files.into_iter().next() {
+            break file;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "encrypted prediction was not published"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let bytes = std::fs::read(prediction_file).unwrap();
+    assert!(bytes.len() >= 29);
+    assert!(!bytes.windows(b"lib.rs".len()).any(|part| part == b"lib.rs"));
+    alpha.stop_daemon_and_wait();
+
+    let beta = Client::with_encrypted_predictions(shared.path());
+    let out_b = TempDir::new().unwrap();
+    beta.start_daemon();
+    beta.compile_checkout(consumer_source.path(), out_b.path());
+    let served = crate_event(&beta.report(), "fsremote").clone();
+    assert_eq!(served["cache_key"], cold["cache_key"], "{served}");
+    assert_eq!(served["result"], "remote_hit", "{served}");
+    assert_eq!(served["dep_info_runs"], 0, "{served}");
+    assert_eq!(served["compiler_runs"], 0, "{served}");
+    beta.stop_daemon_and_wait();
 }
 
 /// A record that no longer describes the tree derives a key nothing was ever
