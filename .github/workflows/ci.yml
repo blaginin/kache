@@ -1201,6 +1201,9 @@ jobs:
         timeout-minutes: 30
         env:
           RUSTC_WRAPPER: ""
+          # Blank wrapper above, so the binary cargo built for the tests is
+          # the bootstrap build; skip the second one (see tests/common).
+          KACHE_TEST_USE_CARGO_BIN_EXE: "1"
       # Clippy otherwise runs only on Linux (`just ci` → `lint`), so lints
       # inside `#[cfg(target_os = "macos")]` code went unchecked. Run it here too.
       - name: cargo clippy (workspace)
@@ -1221,10 +1224,9 @@ jobs:
     runs-on: ${{ fromJSON(!github.event.repository.private && '"windows-latest"' || vars.CI_RUNNER_WINDOWS) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-    # A from-scratch `cargo test --workspace` compile has exceeded the previous
-    # 30m step cap.
-    # Job cap covers filesystem tests (5m), workspace tests (45m), clippy (30m),
-    # and setup.
+    # A from-scratch workspace test compile has exceeded the previous 30m step
+    # cap. Job cap covers filesystem tests (5m), workspace tests (45m),
+    # doctests (15m), clippy (30m), and setup.
     timeout-minutes: 90
     defaults:
       run:
@@ -1297,11 +1299,26 @@ jobs:
         timeout-minutes: 5
         env:
           RUSTC_WRAPPER: ""
-      - name: cargo test (workspace)
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: nextest
+      # nextest runs the test binaries concurrently (cargo test runs them one
+      # after another) and one process per test; it does not run doctests, so
+      # those follow separately. KACHE_TEST_USE_CARGO_BIN_EXE is safe here
+      # because RUSTC_WRAPPER is blank: the binary cargo built for the tests is
+      # exactly what the bootstrap build would produce (see tests/common).
+      - name: cargo nextest (workspace)
         run: |
           rustc --version && cargo --version
-          cargo test --workspace
+          cargo nextest run --workspace --profile ci
         timeout-minutes: 45
+        env:
+          RUSTC_WRAPPER: ""
+          KACHE_TEST_USE_CARGO_BIN_EXE: "1"
+      - name: cargo test --doc (workspace)
+        run: cargo test --workspace --doc
+        timeout-minutes: 15
         env:
           RUSTC_WRAPPER: ""
       # Clippy otherwise runs only on Linux, leaving `#[cfg(windows)]` code

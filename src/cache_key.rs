@@ -4319,7 +4319,10 @@ fn read_tool_version_cache(binary: &Path, prefix: &str) -> Option<String> {
 /// silently ignored because the fallback (running the tool) is always available.
 fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
     if let Some(cache_file) = tool_version_cache_path(binary, prefix) {
-        let _ = std::fs::write(cache_file, version);
+        // The cache directory may not exist yet (a fresh machine, or a CI
+        // runner whose store lives elsewhere); without it nothing was ever
+        // persisted and every process re-ran the probe.
+        crate::probe_memo::write_atomic(&cache_file, version);
     }
 }
 
@@ -6977,6 +6980,39 @@ mod tests {
             // Tagged: cannot collide with any valid-UTF-8 value's bytes.
             assert_eq!(a[0], 0xff);
         }
+    }
+
+    /// The write persists where the read looks, creating the cache directory
+    /// on a fresh machine. Skipped where that directory cannot be created
+    /// (a sandboxed build with no writable home).
+    #[test]
+    fn tool_version_cache_write_is_read_back() {
+        let cache_dir = crate::config::default_cache_dir();
+        if std::fs::create_dir_all(&cache_dir).is_err()
+            || tempfile::tempfile_in(&cache_dir).is_err()
+        {
+            eprintln!("skipping: {} is not writable", cache_dir.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rustc-probe");
+        std::fs::write(&binary, b"not really rustc").unwrap();
+        let prefix = "kache-test-version";
+        let cache_file = tool_version_cache_path(&binary, prefix).unwrap();
+        let _ = std::fs::remove_file(&cache_file);
+        assert_eq!(read_tool_version_cache(&binary, prefix), None);
+
+        write_tool_version_cache(&binary, prefix, "rustc 1.0.0 (test)");
+        assert_eq!(
+            read_tool_version_cache(&binary, prefix).as_deref(),
+            Some("rustc 1.0.0 (test)")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cache_file).unwrap(),
+            "rustc 1.0.0 (test)",
+            "the file is exactly the version string, as before"
+        );
+        let _ = std::fs::remove_file(&cache_file);
     }
 
     #[test]
