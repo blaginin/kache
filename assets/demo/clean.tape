@@ -1,29 +1,28 @@
-# kache clean showcase. Runs after demo.tape + monitor.tape, with
-# project-a duplicated to project-b/c/d via `cp -a` (so hardlinks to
-# kache's store are preserved, and `kache clean` reports a meaningful
-# cached percentage per directory). Same canvas as the other GIFs.
+# kache clean: target directories under the current tree, and how much of
+# each is already in the store. Runs after demo.tape.
 
-Output clean.gif
+Output ../clean.gif
+Output ../clean.webm
 
-Set FontSize 20
+Set Shell "bash"
+Set FontSize 16
 Set Width 1000
 Set Height 640
 Set Theme "Catppuccin Mocha"
 Set Padding 16
 Set TypingSpeed 30ms
+Set Framerate 24
 
-# Banner
-Type "# kache clean — find target/ dirs, see what's cached"
-Sleep 1500ms
-Ctrl+U
-
-# Move to the workspace root (siblings: project-a, project-b, project-c, project-d)
-# and launch the clean TUI.
-Type "cd /workspace && kache clean"
-Sleep 300ms
+Hide
+Type "source env.sh"
 Enter
-Sleep 9s
+Type `cd "$KACHE_DEMO_ROOT" && clear`
+Enter
+Wait
+Show
 
-# Quit without deleting anything.
+Type "kache clean"
+Enter
+Sleep 7s
 Type "q"
 Sleep 800ms

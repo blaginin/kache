@@ -1,51 +1,39 @@
-# kache demo — recorded inside the Docker image.
-# Workload: a tiny synthetic Rust project at /workspace/project-a (see
-# fixtures/). Output goes to /workspace/project-a/demo.gif which the
-# multi-stage Dockerfile copies to a scratch image so
-# `docker build --output` extracts it.
+# First cache hit: the demo crate is built cold off screen, then the same
+# commit is built in a second worktree with an empty target directory.
+# See prepare.sh for the workspace; KACHE_DEMO_ROOT selects where it lives.
 
-Output demo.gif
+Output ../demo.gif
+Output ../demo.webm
 
-Set FontSize 20
+Set Shell "bash"
+Set FontSize 16
 Set Width 1000
 Set Height 640
 Set Theme "Catppuccin Mocha"
 Set Padding 16
 Set TypingSpeed 30ms
+Set Framerate 24
 
-# Banner
-Type "# kache: zero-copy build cache for Rust, C/C++ and more via RUSTC_WRAPPER"
-Sleep 1500ms
-Ctrl+U
-
-# 1. Empty cache
-Type "kache stats"
-Sleep 300ms
+Hide
+Type "source env.sh"
 Enter
+Type `cd "$KACHE_DEMO_ROOT/demo-app" && cargo build --locked >/dev/null 2>&1 && kache stats >/dev/null 2>&1 && clear`
+Enter
+Wait
+Show
+
+Type "# the same commit in a second worktree, empty target directory"
+Enter
+Sleep 800ms
+Type "git worktree add ../demo-app-2 HEAD && cd ../demo-app-2"
+Enter
+Wait
+Sleep 800ms
+Type "KACHE_PROGRESS=hits cargo build --locked"
+Enter
+Wait
 Sleep 2500ms
-
-# 2. Cold build — first time, everything compiles
-Type "cargo build"
-Sleep 300ms
+Type "clear && kache report --last-build | head -12"
 Enter
-Sleep 4s
-
-# 3. Stats after cold — entries cached, all misses
-Type "kache stats"
-Sleep 300ms
-Enter
-Sleep 4s
-
-# 4. Wipe target/ and rebuild — kache restores via hardlinks. Watch the time.
-Type "cargo clean && time cargo build"
-Sleep 300ms
-Enter
-Sleep 5s
-
-# 5. Stats: hit rate jumps, miss-time saved is the headline.
-#    This is the punchline — end here. The README's Screenshots section
-#    has full ASCII renderings of `kache monitor` and `kache clean`.
-Type "kache stats"
-Sleep 300ms
-Enter
-Sleep 5s
+Wait
+Sleep 6s
