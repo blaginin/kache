@@ -3,44 +3,35 @@ title: Installation
 description: Install Kache from a release, package manager, crates.io, or Nix
 ---
 
-Building from a git checkout uses the toolchain pinned in `rust-toolchain.toml`, which rustup installs on first use. `cargo install` builds with your own toolchain and needs Rust 1.95 or newer, the crate's `rust-version`. Release binaries have no Rust runtime dependency.
+```bash
+cargo install kache
+kache init
+```
+
+`kache init` configures Cargo to use Kache. Your Cargo commands stay the same.
 
 ## Recommended methods
 
-<Tabs items={["mise", "cargo-binstall", "cargo install"]}>
-  <Tab value="mise">
+<Tabs items={["cargo install", "cargo-binstall"]}>
+  <Tab value="cargo install">
     ```bash
-    mise use -g github:kunobi-ninja/kache@latest
+    cargo install kache
     ```
 
-    To pin Kache in a project:
-
-    ```toml title="mise.toml"
-    [tools]
-    "github:kunobi-ninja/kache" = "latest"
-    ```
+    Cargo builds Kache with your local Rust toolchain, which must be Rust 1.95 or newer.
   </Tab>
   <Tab value="cargo-binstall">
     ```bash
     cargo binstall kache
     ```
 
-    This downloads a release binary when one exists for your target.
-  </Tab>
-  <Tab value="cargo install">
-    ```bash
-    cargo install kache
-    ```
-
-    Cargo builds Kache with your local Rust toolchain.
+    This downloads a release binary when one exists for your target. Release binaries have no Rust runtime dependency.
   </Tab>
 </Tabs>
 
-Release candidates do not resolve as `latest`. Request their full `x.y.z-rc.n` version explicitly.
-
 ## Package managers
 
-<Tabs items={["Homebrew", "APT", "Windows", "AUR"]}>
+<Tabs items={["Homebrew", "APT", "Windows", "AUR", "mise"]}>
   <Tab value="Homebrew">
     ```bash
     brew install kunobi-ninja/kunobi/kache
@@ -83,6 +74,13 @@ Release candidates do not resolve as `latest`. Request their full `x.y.z-rc.n` v
     `kache-bin` is the official prebuilt package. `kache-git` builds the current main branch; the community `kache` package builds a release from source.
 
     Both official packages install compiler-name shims in `/usr/lib/kache`. For `makepkg`, put `PATH="/usr/lib/kache:$PATH"` in `~/.makepkg.conf`.
+  </Tab>
+  <Tab value="mise">
+    ```bash
+    mise use -g github:kunobi-ninja/kache@latest
+    ```
+
+    Release candidates do not resolve as `latest`. Request their full `x.y.z-rc.n` version explicitly.
   </Tab>
 </Tabs>
 
@@ -135,4 +133,14 @@ kache --version
 kache doctor
 ```
 
-Next, follow the [quick start](/docs/getting-started/quick-start).
+If you have not run it yet, enable Kache with `kache init`. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits.
+
+## Build from source
+
+```bash
+git clone https://github.com/kunobi-ninja/kache
+cd kache
+cargo install --path .
+```
+
+A git checkout builds with the toolchain pinned in `rust-toolchain.toml`, which rustup installs on first use.

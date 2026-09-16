@@ -5,13 +5,7 @@ description: A local-first compiler cache for Rust and C/C++ builds
 
 Kache stores compiler outputs by content and reuses them across builds, repositories, and worktrees. The local cache works on its own. S3-compatible and filesystem remotes are optional.
 
-## Decide first
-
-- Use Kache if you want shared caching across worktrees, local-first operation, built-in inspection tools, or explicit cache synchronization.
-- Read [Kache or sccache?](/docs/getting-started/comparison) if you are comparing compiler caches.
-- Start with a temporary wrapper if you want to evaluate Kache without changing Cargo configuration or installing a service.
-
-## Five-minute Rust trial
+## Get started
 
 Install Kache:
 
@@ -19,24 +13,17 @@ Install Kache:
 cargo install kache
 ```
 
-From a Rust project, run:
-
-```bash
-RUSTC_WRAPPER=kache cargo build
-cargo clean
-KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
-kache stats
-```
-
-The second build should report cache hits. `cargo clean` forces Cargo to ask the compiler for the same outputs again; it is only needed for this demonstration.
-
-Nothing above edits your Cargo configuration. When you are ready to keep Kache enabled, run:
+Then enable it:
 
 ```bash
 kache init
 ```
 
-Use `kache init --check` to preview the changes, or `kache init --no-service` to skip OS service installation.
+That's it. Keep running `cargo build` as usual; Kache now caches the compiler outputs.
+
+`kache init` sets Cargo's `rustc-wrapper` and installs a login service for the background cache. It asks before each change and backs up files it edits.
+
+[Other install methods](/docs/getting-started/installation) include Homebrew, APT, winget, and Nix. The [quick start](/docs/getting-started/quick-start) shows how to confirm cache hits. Comparing compiler caches? Read [Kache or sccache?](/docs/getting-started/comparison).
 
 ## Current support
 

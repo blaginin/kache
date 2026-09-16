@@ -20,13 +20,12 @@ Built by [Kunobi][kunobi-brand].
 
 ```bash
 cargo install kache
-kache init --check   # print the proposed changes
-kache init           # apply them
+kache init
 ```
 
-`kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Use `kache init --no-service` if you want persistent Cargo configuration without an OS service.
+That's it. Your Cargo commands do not change.
 
-Your Cargo commands do not change.
+`kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
 
 ## See your first cache hit
 
