@@ -216,6 +216,8 @@ kache why-miss serde
 kache --json why-miss serde
 ```
 
+<video src="https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/why-miss.webm" aria-label="one source edit, one recompile, and kache why-miss naming the key that changed" autoPlay loop muted playsInline controls />
+
 Explains the latest recorded miss using the event log and stored entries. Store failures and rejected entries take precedence over key comparisons. Repeated misses under the same key in older logs retain an unknown cause when those logs cannot explain what happened.
 
 Terminal and JSON output share the diagnosis and dependency analysis. For a recorded miss, JSON includes `dependency_chain` with changed dependencies, endpoints, and any traversal limit. An unresolved endpoint is not a confirmed cause. `dependency_recording_missing` indicates when enabling `[cache] explain_miss` and rebuilding can provide the missing dependency evidence.
