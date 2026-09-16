@@ -2,7 +2,7 @@ use crate::ArtifactPolicy;
 use crate::blob_validation::validate_blob_metadata;
 use anyhow::{Context, Result};
 pub use kache_format::{CachedFile, EntryMeta};
-use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
+use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -965,6 +965,12 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
 /// headroom on a slow disk while staying far below any sensible cache lifetime.
 pub const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 
+/// A hit re-stamps `last_accessed` only when the previous stamp is at least
+/// this old: well inside [`EVICTION_IDLE_GRACE`], so a restore in flight is
+/// still pinned, and rare enough that concurrent hits stop contending for
+/// the index's write lock.
+pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Entries backfilled with their rebuild cost per GC sweep
 /// (kunobi-ninja/kache#594).
 ///
@@ -988,6 +994,14 @@ pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
 const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a waiter sleeps before its next `try_lock`: 1 ms, doubling up to
+/// [`BUILD_LOCK_POLL_INTERVAL`]. A fixed 100 ms poll cost every waiter half
+/// of that on each hand-off; in a six-job cold cell that was 350 s of sleep
+/// per cell, more than the compiles being waited for.
+pub fn lock_poll_interval(attempt: u32) -> Duration {
+    Duration::from_millis(1u64 << attempt.min(7)).min(BUILD_LOCK_POLL_INTERVAL)
+}
 
 /// Cross-process advisory lock held through an open file handle.
 ///
@@ -1045,6 +1059,7 @@ impl StoreLock {
 
     fn wait_until_available(path: &Path, timeout: Duration) -> Result<bool> {
         let start = std::time::Instant::now();
+        let mut attempt = 0;
         loop {
             if let Some(lock) = Self::try_acquire(path)? {
                 drop(lock);
@@ -1054,8 +1069,9 @@ impl StoreLock {
                 return Ok(false);
             }
             std::thread::sleep(
-                BUILD_LOCK_POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())),
+                lock_poll_interval(attempt).min(timeout.saturating_sub(start.elapsed())),
             );
+            attempt += 1;
         }
     }
 }
@@ -1252,6 +1268,17 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
     db.pragma_update(None, "busy_timeout", "5000")?;
 
+    // Every statement below is a no-op on a current index, yet each one still
+    // opens a write transaction, so every wrapper process queued behind
+    // whichever miss was storing (hundreds of milliseconds per hit in a
+    // contended cell). The generation stamped after the DDL says the schema
+    // is current; bump [`INDEX_SCHEMA_GENERATION`] whenever a statement is
+    // added or changed below.
+    let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if generation == INDEX_SCHEMA_GENERATION {
+        return Ok(());
+    }
+
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS entries (
             cache_key TEXT PRIMARY KEY,
@@ -1364,9 +1391,14 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     )?;
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
+    db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
 
     Ok(())
 }
+
+/// The `user_version` an index carries once every statement of
+/// [`initialize_db`] has run. Bump it with any schema change.
+const INDEX_SCHEMA_GENERATION: i64 = 1;
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
 /// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
@@ -1669,6 +1701,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.file_hash_cache().record_verified(fingerprint, hash);
     }
 
+    /// [`Self::record_verified_file_hash`] for every restored file of one
+    /// hit, in one transaction with a short wait: the rows only save a later
+    /// hash, so a busy index (a miss's store transaction elsewhere) drops them
+    /// instead of stalling the hit.
+    pub fn record_verified_file_hashes(
+        &self,
+        restored: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if restored.is_empty() {
+            return;
+        }
+        let _ = self.db.busy_timeout(std::time::Duration::from_millis(100));
+        let written = (|| -> rusqlite::Result<()> {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            for (fingerprint, hash) in restored {
+                self.file_hash_cache().record_verified(fingerprint, hash);
+            }
+            self.db.execute_batch("COMMIT")
+        })();
+        let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
+        if let Err(error) = written {
+            let _ = self.db.execute_batch("ROLLBACK");
+            tracing::debug!("restored file hashes not memoised (index busy): {error}");
+        }
+    }
+
     /// Associate a stable file with its already-known content hash, avoiding a
     /// redundant read when it becomes a compiler input. Call this only after
     /// every store-side operation that may change the file's fingerprint and
@@ -1783,11 +1841,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Update access time and hit count
-        self.db.execute(
-            "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 WHERE cache_key = ?1",
-            params![cache_key],
-        )?;
+        // Update access time and hit count. The stamp pins the entry against
+        // eviction for [`EVICTION_IDLE_GRACE`]; one that is already fresh
+        // needs no write, and in a contended cell every hit's write would
+        // queue behind the misses' store transactions. Hit counts therefore
+        // count at most one hit per entry per [`HIT_STAMP_INTERVAL`].
+        let age_seconds: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT strftime('%s', 'now') - strftime('%s', last_accessed) FROM entries \
+                 WHERE cache_key = ?1",
+                params![cache_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64) {
+            self.db.execute(
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 \
+                 WHERE cache_key = ?1",
+                params![cache_key],
+            )?;
+        }
 
         Ok(Some(meta))
     }
@@ -3360,6 +3434,28 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(());
         };
+        // The upsert below refuses to touch a fresh, unchanged row, but even
+        // a refused upsert takes the index's write lock; read first so a
+        // warm target directory costs one query per invocation, not a wait
+        // behind whichever miss is storing.
+        let fresh: Option<bool> = self
+            .db
+            .query_row(
+                "SELECT last_seen > unixepoch() - 300
+                    AND workspace_root = ?2 AND device = ?3 AND inode = ?4
+                 FROM target_roots WHERE path = ?1",
+                params![
+                    target.to_string_lossy(),
+                    workspace_root.to_string_lossy(),
+                    identity.device.to_string(),
+                    identity.inode.to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if fresh == Some(true) {
+            return Ok(());
+        }
         let changed = self.db.execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode)
@@ -4955,6 +5051,49 @@ pub struct EntryInfo {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn lock_polls_back_off_from_a_millisecond_to_the_interval() {
+        let naps: Vec<u64> = (0..10)
+            .map(|attempt| lock_poll_interval(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(naps, vec![1, 2, 4, 8, 16, 32, 64, 100, 100, 100]);
+    }
+
+    /// Opening an index runs its DDL once: the second open finds the schema
+    /// generation current and skips every statement (each would otherwise
+    /// take the write lock), while an index from before the stamp still
+    /// migrates.
+    #[test]
+    fn index_ddl_runs_once_per_schema_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        let generation: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+        // A pre-stamp index (generation 0) migrates and gets stamped.
+        db.pragma_update(None, "user_version", 0_i64).unwrap();
+        db.execute_batch("DROP TABLE target_roots").unwrap();
+        drop(db);
+        let db = open_index_db(&path).unwrap();
+        let generation: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'target_roots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tables, 1,
+            "the dropped table was recreated by the migration"
+        );
+    }
     type Store = ArtifactStore<TestPolicy>;
     struct TestPolicy;
     impl ArtifactPolicy for TestPolicy {
@@ -6115,11 +6254,16 @@ mod tests {
                 "the probe must leave accounting to the pin writer"
             );
 
+            // A hit re-stamps an entry only once per `HIT_STAMP_INTERVAL`;
+            // the put just stamped it, so age it first.
+            store.set_last_accessed_for_test("probe_key", "-1 minutes");
             let local = store.get("probe_key").unwrap().unwrap();
             assert_eq!(local.files, meta.files);
             assert_eq!(local.stdout, meta.stdout);
             assert_eq!(local.stderr, meta.stderr);
             assert_eq!(hit_count(), 1, "get must record the hit");
+            let _ = store.get("probe_key").unwrap().unwrap();
+            assert_eq!(hit_count(), 1, "a fresh stamp is not rewritten");
 
             assert!(matches!(
                 probe_entry_readonly(&ro, &store_dir, "no_such_key"),
@@ -6255,11 +6399,25 @@ mod tests {
         assert!(
             matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "verified")
         );
+        let second = dir.path().join("second.rlib");
+        fs::write(&second, vec![9; 65_536]).unwrap();
+        let second_fingerprint = FileFingerprint::from_path(&second).unwrap();
+        store.record_verified_file_hashes(&[
+            (fingerprint.clone(), "batched"),
+            (second_fingerprint, "batched-second"),
+        ]);
+        assert!(
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "batched")
+        );
+        assert!(
+            matches!(store.file_hash_lookup(&second), FileHashLookup::Hit(hash) if hash == "batched-second")
+        );
+        store.record_verified_file_hashes(&[]);
         drop(store);
 
         let store = Store::open(&config).unwrap();
         assert!(
-            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "verified")
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "batched")
         );
         fs::write(&artifact, vec![8; 65_537]).unwrap();
         assert!(matches!(

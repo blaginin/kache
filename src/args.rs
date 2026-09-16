@@ -332,6 +332,13 @@ fn parse_emit_value(value: &str, kinds: &mut Vec<String>, dep_info_output: &mut 
 }
 
 impl RustcArgs {
+    /// Is this `clippy-driver <rustc> <args>`, Cargo's composition of
+    /// `RUSTC_WRAPPER` with Clippy as `RUSTC_WORKSPACE_WRAPPER`?
+    pub fn is_clippy_chain(&self) -> bool {
+        self.inner_rustc.is_some()
+            && crate::compiler::is_clippy_driver(&self.rustc.to_string_lossy())
+    }
+
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
     pub fn parse(args: &[String]) -> Result<Self> {
@@ -2358,5 +2365,33 @@ mod tests {
         .collect();
         let parsed = RustcArgs::parse(&args).unwrap();
         assert_eq!(parsed.features, vec!["alloc", "derive", "std"]);
+    }
+
+    #[test]
+    fn a_clippy_chain_needs_both_the_driver_and_an_inner_rustc() {
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let chain = parse(&[
+            "/toolchain/bin/clippy-driver",
+            "/toolchain/bin/rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+        ]);
+        assert!(chain.inner_rustc.is_some());
+        assert!(chain.is_clippy_chain());
+        let plain = parse(&["/toolchain/bin/rustc", "--crate-name", "kt", "src/lib.rs"]);
+        assert!(plain.inner_rustc.is_none());
+        assert!(!plain.is_clippy_chain(), "no inner rustc");
+        let other_wrapper = parse(&[
+            "/toolchain/bin/dylint-driver",
+            "/toolchain/bin/rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+        ]);
+        assert!(other_wrapper.inner_rustc.is_some());
+        assert!(!other_wrapper.is_clippy_chain(), "not the clippy driver");
     }
 }

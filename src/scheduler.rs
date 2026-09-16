@@ -40,6 +40,38 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Coalesce dependency discovery before taking a compile flight, a permit or
+/// a cache-key lock. The holder keeps this guard through prediction publish.
+/// Errors and timeout leave the ordinary key/compile path available.
+pub(crate) fn join_discovery(cache_dir: &Path, identity: &str) -> Option<StoreLock> {
+    let _trace = crate::phase_trace::phase("discovery_flight_wait");
+    let path = cache_dir
+        .join("scheduler/discovery")
+        .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
+    acquire_discovery(&path, WAIT_TIMEOUT, POLL_INTERVAL).unwrap_or_else(|error| {
+        tracing::debug!("discovery flight unavailable: {error:#}");
+        None
+    })
+}
+
+fn acquire_discovery(path: &Path, timeout: Duration, poll: Duration) -> Result<Option<StoreLock>> {
+    let start = std::time::Instant::now();
+    let mut attempt = 0;
+    loop {
+        if let Some(lock) = StoreLock::try_acquire(path)? {
+            return Ok(Some(lock));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        // Back off from 1 ms up to `poll`: a waiter learns of the owner's
+        // release within milliseconds instead of half a poll interval.
+        let nap = crate::store::lock_poll_interval(attempt).min(poll);
+        std::thread::sleep(nap.min(timeout.saturating_sub(start.elapsed())));
+        attempt += 1;
+    }
+}
+
 /// Number of permit slots.
 ///
 /// Defaults to `std::thread::available_parallelism()`, with a floor of 1
@@ -248,6 +280,7 @@ impl Scheduler {
     }
 
     fn join_flight(&self, identity: &FlightIdentity) -> FlightJoin {
+        let _trace = crate::phase_trace::phase("flight_join");
         let path = self.flight_path(identity);
         match StoreLock::try_acquire(&path) {
             Ok(Some(lock)) => FlightJoin::Owner(lock),
@@ -259,6 +292,7 @@ impl Scheduler {
                     "waiting for in-flight compile"
                 );
                 let waited = std::time::Instant::now();
+                let _trace_wait = crate::phase_trace::phase("flight_wait");
                 let outcome = wait_for_lock(&path, self.wait_timeout, self.poll_interval);
                 crate::opcounts::record_flight_wait(waited.elapsed());
                 match outcome {
@@ -299,6 +333,7 @@ impl Scheduler {
     /// attributed to `permit_wait_ms`: an immediately free pool costs
     /// microseconds, a saturated one costs the wait.
     fn acquire_permit(&self, weight: u32) -> Option<Permit> {
+        let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
         let permit = self.wait_for_permit(weight);
         crate::opcounts::record_permit_wait(started.elapsed());
@@ -308,6 +343,7 @@ impl Scheduler {
     fn wait_for_permit(&self, weight: u32) -> Option<Permit> {
         let need = weight.clamp(1, self.pool_size) as usize;
         let start = std::time::Instant::now();
+        let mut attempt = 0;
         loop {
             match try_collect_slots(self, need) {
                 Ok(Some(slots)) => return Some(Permit { _slots: slots }),
@@ -323,10 +359,9 @@ impl Scheduler {
                 tracing::debug!("scheduler permit wait timed out; compiling without a permit");
                 return None;
             }
-            std::thread::sleep(
-                self.poll_interval
-                    .min(self.wait_timeout.saturating_sub(start.elapsed())),
-            );
+            let nap = crate::store::lock_poll_interval(attempt).min(self.poll_interval);
+            std::thread::sleep(nap.min(self.wait_timeout.saturating_sub(start.elapsed())));
+            attempt += 1;
         }
     }
 }
@@ -350,6 +385,7 @@ fn try_collect_slots(scheduler: &Scheduler, need: usize) -> Result<Option<Vec<St
 
 fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool> {
     let start = std::time::Instant::now();
+    let mut attempt = 0;
     loop {
         if let Some(lock) = StoreLock::try_acquire(path)? {
             drop(lock);
@@ -358,7 +394,9 @@ fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool>
         if start.elapsed() >= timeout {
             return Ok(false);
         }
-        std::thread::sleep(poll.min(timeout.saturating_sub(start.elapsed())));
+        let nap = crate::store::lock_poll_interval(attempt).min(poll);
+        std::thread::sleep(nap.min(timeout.saturating_sub(start.elapsed())));
+        attempt += 1;
     }
 }
 
@@ -1709,6 +1747,46 @@ mod tests {
             "the wait must be attributed to permit_wait_ms"
         );
         let _ = child.wait();
+    }
+
+    #[test]
+    fn discovery_flights_hold_until_publish_and_fail_open() {
+        let dir = temp_cache();
+        let path = dir.path().join("discovery/unit");
+        let owner = acquire_discovery(&path, Duration::ZERO, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert!(
+            acquire_discovery(&path, Duration::from_millis(20), Duration::from_millis(2))
+                .unwrap()
+                .is_none()
+        );
+        let waiter_path = path.clone();
+        let waiter = std::thread::spawn(move || {
+            let guard = acquire_discovery(
+                &waiter_path,
+                Duration::from_secs(5),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+            assert!(guard.is_some());
+            assert_eq!(
+                fs::read(waiter_path.with_extension("published")).unwrap(),
+                b"ready"
+            );
+        });
+        fs::write(path.with_extension("published"), b"ready").unwrap();
+        drop(owner);
+        waiter.join().unwrap();
+        assert!(
+            acquire_discovery(&path, Duration::ZERO, Duration::ZERO)
+                .unwrap()
+                .is_some()
+        );
+        let bad = dir.path().join("not-a-directory");
+        fs::write(&bad, b"file").unwrap();
+        assert!(join_discovery(&bad, "unit").is_none());
+        assert!(join_discovery(dir.path(), "different-unit").is_some());
     }
 
     #[test]
