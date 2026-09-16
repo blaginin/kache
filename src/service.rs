@@ -105,6 +105,28 @@ pub(crate) fn service_exe_mismatch(path: &Path) -> Option<ServiceExeMismatch> {
 
 // ── Install ──────────────────────────────────────────────────────
 
+/// Whether [`install`] can register a login service on this machine.
+///
+/// Linux needs a reachable systemd user manager. Containers and most CI
+/// runners have none, and every `systemctl --user` call there fails with
+/// "Failed to connect to bus" (#1080).
+pub fn login_service_available() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    systemd_user_manager_reachable()
+}
+
+fn systemd_user_manager_reachable() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn install() -> Result<()> {
     let exe = std::env::current_exe()
         .context("resolving current executable")?
@@ -273,6 +295,12 @@ WantedBy=default.target
 }
 
 fn install_systemd(exe: &std::path::Path) -> Result<()> {
+    // Check before writing the unit, so a failed install leaves no file behind.
+    anyhow::ensure!(
+        systemd_user_manager_reachable(),
+        "no systemd user session is available (systemctl --user cannot connect); \
+         start the daemon with `kache daemon start` instead"
+    );
     let unit = unit_path();
 
     // If already installed, stop old service first
@@ -290,25 +318,17 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
 
     let content = systemd_unit_content(exe);
 
+    let created = !unit.exists();
     std::fs::write(&unit, &content).context("writing systemd unit")?;
 
-    // Reload and enable
-    let reload = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output()
-        .context("running systemctl daemon-reload")?;
-    if !reload.status.success() {
-        let stderr = String::from_utf8_lossy(&reload.stderr);
-        anyhow::bail!("systemctl daemon-reload failed: {stderr}");
-    }
-
-    let enable = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", UNIT_NAME])
-        .output()
-        .context("running systemctl enable")?;
-    if !enable.status.success() {
-        let stderr = String::from_utf8_lossy(&enable.stderr);
-        anyhow::bail!("systemctl enable --now failed: {stderr}");
+    let registered = run_systemctl_user(&["daemon-reload"])
+        .and_then(|()| run_systemctl_user(&["enable", "--now", UNIT_NAME]));
+    if let Err(error) = registered {
+        // Do not leave a unit behind that systemd never accepted.
+        if created {
+            let _ = std::fs::remove_file(&unit);
+        }
+        return Err(error);
     }
 
     // Best-effort: enable linger so user services survive logout
@@ -324,6 +344,21 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     println!("  logs: journalctl --user -u {UNIT_NAME}");
     println!("\nThe daemon will now start automatically on login and restart on crash.");
     println!("Use `kache daemon` to verify, `kache daemon log` to stream logs.");
+    Ok(())
+}
+
+fn run_systemctl_user(args: &[&str]) -> Result<()> {
+    let command = args.join(" ");
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .with_context(|| format!("running systemctl --user {command}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "systemctl --user {command} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(())
 }
 
