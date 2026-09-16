@@ -33,6 +33,8 @@ That's it. Your Cargo commands do not change.
 
 After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. The second tree's report lists the hits, and a bypass reason for every unit that still compiled.
 
+![A second worktree of the same commit building from cache hits, then the build report showing 42 of 42 crates cached.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+
 To try this without touching Cargo's config, skip `kache init` and prefix both builds with `RUSTC_WRAPPER=kache`. That enables the Rust wrapper only; C and C++ build scripts need the [C/C++ setup](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 
 ## How it works
@@ -132,6 +134,8 @@ kache gc                      # enforce cache limits
 kache sync                    # pull from and push to the configured remote
 kache daemon status           # inspect the background service
 ```
+
+![kache monitor following a build, then the Why, Projects, and Store tabs.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.gif)
 
 Run `kache help <command>` for exact flags. The [command reference](https://kunobi.ninja/docs/kache/commands/reference) covers every top-level command.
 

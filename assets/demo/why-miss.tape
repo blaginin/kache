@@ -1,8 +1,8 @@
-# kache clean: target directories under the current tree, and how much of
-# each is already in the store. Runs after demo.tape.
+# One source edit, one recompile, and why-miss explains which key changed.
+# Runs after demo.tape (uses its second worktree).
 
-Output ../clean.gif
-Output ../clean.webm
+Output ../why-miss.gif
+Output ../why-miss.webm
 
 Set Shell "bash"
 Set FontSize 16
@@ -18,13 +18,19 @@ Type 'export KACHE_DEMO_ROOT="${KACHE_DEMO_ROOT:-$([ "$(uname)" = Darwin ] && ec
 Enter
 Type 'export PATH="$KACHE_DEMO_ROOT/bin:$HOME/.cargo/bin:$PATH" KACHE_CACHE_DIR=$KACHE_DEMO_ROOT/store KACHE_RUNTIME_DIR=$KACHE_DEMO_ROOT/runtime KACHE_CONFIG=$KACHE_DEMO_ROOT/kache.toml RUSTC_WRAPPER=$KACHE_DEMO_ROOT/bin/kache CARGO_TERM_COLOR=always'
 Enter
-Type `cd "$KACHE_DEMO_ROOT" && clear`
+Type `cd "$KACHE_DEMO_ROOT/demo-app-2" && clear`
 Enter
 Wait
 Show
 
-Type "kache clean"
+Type "perl -pi -e 's/Hash every file/Hash each file/' src/main.rs"
 Enter
-Sleep 7s
-Type "q"
 Sleep 800ms
+Type "KACHE_PROGRESS=verbose cargo build --locked"
+Enter
+Wait
+Sleep 2s
+Type "clear && kache why-miss demo_app"
+Enter
+Wait
+Sleep 7s

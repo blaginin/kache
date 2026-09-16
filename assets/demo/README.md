@@ -1,61 +1,34 @@
-# Demo GIF
+# Recordings
 
-Self-contained, reproducible recording of the kache cold→warm flow.
-Everything runs inside a Docker container — no host install needed beyond
-Docker itself.
+The GIFs and WebM files in `assets/` are rendered from the tapes in this
+directory with [VHS](https://github.com/charmbracelet/vhs). The README embeds
+the GIFs; the docs pages embed the WebM files.
 
 ## Regenerate
 
-From the repo root:
+VHS needs `ttyd` and `ffmpeg` on `PATH`. VHS 0.12.0 exits without writing any
+output ([charmbracelet/vhs#787](https://github.com/charmbracelet/vhs/issues/787));
+use 0.11.0.
 
 ```sh
-docker buildx build --output type=local,dest=./assets ./assets/demo
+cargo build --release
+assets/demo/prepare.sh target/release/kache
+cd assets/demo
+vhs demo.tape && vhs why-miss.tape && vhs monitor.tape && vhs clean.tape
 ```
 
-Produces `assets/demo.gif`, `assets/monitor.gif`, and `assets/clean.gif`.
+`prepare.sh` builds a small crate with a committed lockfile under
+`KACHE_DEMO_ROOT` (default `/Users/Shared/kache-demo` on macOS, where
+`kache clean` skips `/private`, and `/tmp/kache-demo` elsewhere) with a scratch
+store and configuration, so the recordings never touch your own cache. The
+tapes build on each other's state: run them in the order above, and re-run
+`prepare.sh` to start over.
 
-## What the demo shows
+## Scenes
 
-Workload: a tiny synthetic Rust project ([fixtures/project-a/](fixtures/project-a/))
-that depends on `serde`, `serde_json`, and `anyhow`. Sized to fit Docker
-Desktop's default CPU/RAM allocation. The flow:
-
-1. `kache stats` on an empty cache.
-2. `cargo build` — cold compile. Every artifact is a miss; kache writes
-   each one to its content-addressed store under `~/.cache/kache`.
-3. `kache stats` — cache now holds the dep blobs.
-4. `cargo clean && time cargo build` — `target/` is wiped, then the
-   second build pulls every artifact back via hardlinks. The `time`
-   output is the punchline: typically ~50% of cold time, with the savings
-   coming from rustc work avoided rather than disk I/O.
-5. `kache stats` — hit rate and miss-time saved climb visibly.
-6. `kache monitor` Build tab — entries, hardlink count, live hit rate.
-
-## Files
-
-- `Dockerfile` — multi-stage. Stage 1 sets up Rust 1.95, kache v0.1.1
-  from the musl release tarball, and the fixture workspace; then runs
-  both vhs tapes in sequence. Stage 2 is `FROM scratch` with both GIFs,
-  so `docker build --output` extracts them.
-- `demo.tape` — main flow recording (cold→warm). 1000×640, FontSize 20.
-- `monitor.tape` — `kache monitor` showcase against the populated cache
-  left behind by `demo.tape`. Same 1000×640 / FontSize 20 so all three
-  GIFs render at a consistent scale on GitHub. Stays on the Build tab —
-  the Store/Projects/Transfer tables are too column-dense to read
-  clearly at this size; readers can run `kache monitor` locally to
-  inspect them.
-- `clean.tape` — `kache clean` showcase. Before this tape runs, the
-  Dockerfile duplicates `project-a` to `project-b/c/d` with `cp -a`
-  (preserving hardlinks to kache's store) so `kache clean` lists four
-  target/ dirs with realistic cached percentages.
-- `fixtures/project-a/` — minimal Rust binary depending on serde stack.
-
-## Tuning the workload
-
-To swap the demo crate, edit
-[`fixtures/project-a/Cargo.toml`](fixtures/project-a/Cargo.toml). Larger
-deps (e.g. `tokio` with `full` features, `aws-sdk-s3`, `ratatui`) make the
-cold-build delta more dramatic but stretch the image build and the
-recording, and may exceed Docker Desktop's default resource budget — vhs
-runs Chrome headless internally and competes with cargo for CPU. Bump
-Docker's allocated CPUs/RAM if you want to demo a heavier workload.
+| Tape | Shows |
+| --- | --- |
+| `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, every crate a hit, then `kache report --last-build`. |
+| `why-miss.tape` | One source edit, one recompile, and `kache why-miss` naming the key that changed. |
+| `monitor.tape` | `kache monitor` following a build in a third worktree, then the Why, Projects, and Store tabs. |
+| `clean.tape` | `kache clean` listing the target directories under the tree and how much of each is already in the store. |
