@@ -6,7 +6,7 @@
 
 # Kache
 
-Kache is a local-first compiler cache for Rust and C/C++. It stores build outputs by content, reuses them across worktrees, and can copy them to S3-compatible or filesystem remotes.
+Kache is a compiler cache for Rust, C/C++, and CUDA. It keys every compiler invocation by the content of its inputs, so a crate built once is restored instead of rebuilt in your next worktree, branch, or CI run. Outputs live in a local content-addressed store and can be shared through S3-compatible or filesystem remotes. Linux, macOS, and Windows are supported and release-tested.
 
 Built by [Kunobi][kunobi-brand].
 
@@ -27,11 +27,24 @@ That's it. Your Cargo commands do not change.
 
 `kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
 
+`cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix; release builds cover x86_64 and ARM on all three platforms. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
+
 ## See your first cache hit
 
-After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. Use the report to check cache hits and investigate misses.
+After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. The second tree's report lists the hits, and a bypass reason for every unit that still compiled.
 
-It also includes a trial without persistent Cargo configuration. That trial enables the Rust wrapper only; native builds need the [C/C++ setup](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
+To try this without touching Cargo's config, skip `kache init` and prefix both builds with `RUSTC_WRAPPER=kache`. That enables the Rust wrapper only; C and C++ build scripts need the [C/C++ setup](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
+
+## How it works
+
+Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
+
+- The wrapper parses each `rustc`, `cc`, `c++`, or `nvcc` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
+- The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, which is what keeps a second worktree cheap on disk.
+- Concurrent builds that reach the same key join one flight, so the compiler runs once per key on a machine, however many Cargo processes ask for it.
+- The daemon serves remote lookups after a local miss and uploads new entries in the background.
+
+Hits, misses, and passthroughs are reported per unit, and `kache why-miss` explains what changed. [Read the architecture →](https://kunobi.ninja/docs/kache/how-it-works/architecture)
 
 ## What Kache caches
 
@@ -39,7 +52,8 @@ It also includes a trial without persistent Cargo configuration. That trial enab
 | --- | --- | --- |
 | Rust libraries and build scripts | Supported | Use `RUSTC_WRAPPER=kache` or `kache init` |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
-| C and C++ object files | Supported | Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
+| C and C++ object files | Supported | GCC, Clang, Apple Clang, and clang-cl. Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
+| CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
@@ -109,6 +123,7 @@ Credentials come from the standard AWS environment variables or credential chain
 ```bash
 kache monitor                 # live build and cache activity
 kache stats                   # non-interactive summary
+kache report --last-build     # hits, misses, and bypass reasons of the latest build
 kache doctor                  # setup and integrity checks
 kache install-shims           # Unix compiler-name PATH farm
 kache why-miss <crate>        # explain the latest miss
@@ -119,6 +134,8 @@ kache daemon status           # inspect the background service
 ```
 
 Run `kache help <command>` for exact flags. The [command reference](https://kunobi.ninja/docs/kache/commands/reference) covers every top-level command.
+
+To pass one build through without changing the setup, run it with `KACHE_DISABLED=1`.
 
 ## Documentation
 
