@@ -25,19 +25,19 @@ kache init
 
 That's it. Your Cargo commands do not change.
 
+![kache init, then a cold build, cargo clean, and a warm build restored from the cache](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/quickstart.gif)
+
 `kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
 
 ## See your first cache hit
 
 After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. Use the report to check cache hits and investigate misses.
 
-It also includes a trial without persistent Cargo configuration. That trial enables the Rust wrapper only; native builds need the [C/C++ setup](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
-
 ## What Kache caches
 
 | Workload | Status | Notes |
 | --- | --- | --- |
-| Rust libraries and build scripts | Supported | Use `RUSTC_WRAPPER=kache` or `kache init` |
+| Rust libraries and build scripts | Supported | Run `kache init` |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
 | C and C++ object files | Supported | Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
 | Local storage | Built in | Content-addressed store with garbage collection |

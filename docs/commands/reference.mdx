@@ -86,6 +86,8 @@ kache clean --tracked --stale 14d --yes
 
 `clean` recursively finds `target/` directories below the current directory. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
 
+![kache clean listing three target directories with their total and cached sizes](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/clean.gif)
+
 `--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped.
 
 ## `kache init`
