@@ -99,18 +99,6 @@ APT and AUR packages install `/usr/lib/kache`. Nix packages include the same sym
 
 Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 
-## CUDA
-
-Point the build at `kache nvcc`, or register Kache as the CMake launcher:
-
-```bash
-export CUDACXX="kache nvcc"
-# or
-cmake -DCMAKE_CUDA_COMPILER_LAUNCHER=kache ...
-```
-
-Kache caches each single-source `nvcc -c` or `-dc` object as one entry, keyed on the raw source and header contents rather than on preprocessed output, so host-only code behind `__CUDA_ARCH__` guards is covered. Objects are portable across checkouts and machines. Device linking, `-ptx` and `-cubin` emission, and device debug builds pass through. See [CUDA](https://kunobi.ninja/docs/kache/getting-started/cuda).
-
 ## Storage and remotes
 
 The default local cache is:
