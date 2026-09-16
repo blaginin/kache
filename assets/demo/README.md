@@ -17,10 +17,11 @@ cd assets/demo
 vhs demo.tape && vhs why-miss.tape && vhs monitor.tape && vhs clean.tape
 ```
 
-`prepare.sh` builds a small crate with a committed lockfile under
-`KACHE_DEMO_ROOT` (default `/Users/Shared/kache-demo` on macOS, where
-`kache clean` skips `/private`, and `/tmp/kache-demo` elsewhere) with a scratch
-store and configuration, so the recordings never touch your own cache. The
+`env.sh` picks the root (`/Users/Shared/kache-demo` on macOS, where `kache clean`
+skips `/private`; `/tmp/kache-demo` elsewhere) and points Kache at a scratch
+store and configuration there, so the recordings never touch your own cache.
+Every tape sources it off screen. `prepare.sh` builds a small crate with a
+committed lockfile under that root. The
 tapes build on each other's state: run them in the order above, and re-run
 `prepare.sh` to start over.
 

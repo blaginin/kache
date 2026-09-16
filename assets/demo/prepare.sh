@@ -4,16 +4,15 @@
 #   assets/demo/prepare.sh [path/to/kache]     # defaults to `kache` on PATH
 #   cd assets/demo && vhs demo.tape && vhs why-miss.tape && vhs monitor.tape && vhs clean.tape
 #
-# Everything lives under $KACHE_DEMO_ROOT (default /Users/Shared/kache-demo on
-# macOS, where `kache clean` skips /private, and /tmp/kache-demo elsewhere): a
-# scratch store and config, so the
+# Everything lives under KACHE_DEMO_ROOT from env.sh: a scratch store and config, so the
 # recordings never touch your own cache, and a small crate with a lockfile
 # committed to a git repository. `demo.tape` builds it cold off screen, then
 # records the second worktree; the later tapes build on that state, so run
 # them in the order above. Re-run this script to start over.
 set -euo pipefail
 kache_bin="$(command -v "${1:-kache}")"
-root="${KACHE_DEMO_ROOT:-$([ "$(uname)" = Darwin ] && echo /Users/Shared/kache-demo || echo /tmp/kache-demo)}"
+. "$(dirname "$0")/env.sh"
+root="$KACHE_DEMO_ROOT"
 rm -rf "$root"
 mkdir -p "$root/bin" "$root/store" "$root/runtime"
 ln -s "$kache_bin" "$root/bin/kache"
