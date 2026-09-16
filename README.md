@@ -6,7 +6,7 @@
 
 # Kache
 
-Kache is a compiler cache for Rust and C/C++. It keys every compiler invocation by the content of its inputs, so a crate built once is restored instead of rebuilt in your next worktree, branch, or CI run. Outputs live in a local content-addressed store and can be shared through S3-compatible or filesystem remotes.
+Kache is a compiler cache for Rust, C/C++, and CUDA. It keys every compiler invocation by the content of its inputs, so a crate built once is restored instead of rebuilt in your next worktree, branch, or CI run. Outputs live in a local content-addressed store and can be shared through S3-compatible or filesystem remotes. Linux, macOS, and Windows are supported and release-tested.
 
 Built by [Kunobi][kunobi-brand].
 
@@ -27,7 +27,7 @@ That's it. Your Cargo commands do not change.
 
 `kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
 
-`cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix; release builds cover Linux (musl), macOS, and Windows on x86_64 and ARM. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
+`cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix; release builds cover x86_64 and ARM on all three platforms. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
 
 ## See your first cache hit
 
@@ -39,7 +39,7 @@ To try this without touching Cargo's config, skip `kache init` and prefix both b
 
 Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
 
-- The wrapper parses each `rustc`, `cc`, or `c++` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
+- The wrapper parses each `rustc`, `cc`, `c++`, or `nvcc` invocation, hashes the inputs that change the output, and normalizes the machine-local paths that do not. Two worktrees of the same revision produce the same key.
 - The store keeps outputs as content-addressed blobs. Identical bytes are stored once. Restores use copy-on-write clones where the filesystem supports them, which is what keeps a second worktree cheap on disk.
 - Concurrent builds that reach the same key join one flight, so the compiler runs once per key on a machine, however many Cargo processes ask for it.
 - The daemon serves remote lookups after a local miss and uploads new entries in the background.
@@ -52,7 +52,8 @@ Hits, misses, and passthroughs are reported per unit, and `kache why-miss` expla
 | --- | --- | --- |
 | Rust libraries and build scripts | Supported | Use `RUSTC_WRAPPER=kache` or `kache init` |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
-| C and C++ object files | Supported | Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
+| C and C++ object files | Supported | GCC, Clang, Apple Clang, and clang-cl. Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
+| CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
@@ -97,6 +98,18 @@ APT and AUR packages install `/usr/lib/kache`. Nix packages include the same sym
 `kache init` can create the user farm; it does not change `PATH`. For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache install-shims --from-path`.
 
 Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
+
+## CUDA
+
+Point the build at `kache nvcc`, or register Kache as the CMake launcher:
+
+```bash
+export CUDACXX="kache nvcc"
+# or
+cmake -DCMAKE_CUDA_COMPILER_LAUNCHER=kache ...
+```
+
+Kache caches each single-source `nvcc -c` or `-dc` object as one entry, keyed on the raw source and header contents rather than on preprocessed output, so host-only code behind `__CUDA_ARCH__` guards is covered. Objects are portable across checkouts and machines. Device linking, `-ptx` and `-cubin` emission, and device debug builds pass through. See [CUDA](https://kunobi.ninja/docs/kache/getting-started/cuda).
 
 ## Storage and remotes
 
