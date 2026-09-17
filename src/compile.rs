@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 
 use crate::compiler::{ArtifactSet, classify_by_filename};
 
@@ -189,21 +189,10 @@ pub fn run_rustc(
         .spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
     let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
-    let mut child_stdout = child.stdout.take().context("capturing rustc stdout")?;
+    let child_stdout = child.stdout.take().context("capturing rustc stdout")?;
     let child_stderr = child.stderr.take().context("capturing rustc stderr")?;
     let forwarding_metadata = metadata_sink.is_some();
-    let captured = std::thread::scope(|scope| {
-        let stdout = scope.spawn(move || {
-            let mut bytes = Vec::new();
-            child_stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr = capture_rustc_stderr(child_stderr, metadata_sink);
-        let status = child.wait();
-        let stdout = stdout
-            .join()
-            .map_err(|_| anyhow::anyhow!("rustc stdout reader panicked"))?;
-        Ok::<_, anyhow::Error>((status?, stdout?, stderr?))
-    });
+    let captured = capture_rustc_output(&mut child, child_stdout, child_stderr, metadata_sink);
     drop(compiler_trace);
     drop(response_file);
     if let Some(monitor) = monitor {
@@ -269,6 +258,41 @@ pub fn run_rustc(
             .then(|| String::from_utf8_lossy(&captured_stderr.undelivered).into_owned()),
         artifacts,
         keepalive: Vec::new(),
+    })
+}
+
+fn capture_rustc_output(
+    child: &mut Child,
+    mut stdout: impl Read + Send,
+    stderr: impl Read,
+    metadata_sink: Option<&mut dyn Write>,
+) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
+    let child = std::sync::Mutex::new(child);
+    std::thread::scope(|scope| {
+        let stdout = scope.spawn(|| {
+            let mut bytes = Vec::new();
+            let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+            if result.is_err() {
+                // Either reader must be able to unblock the other immediately.
+                // The child may already have exited, so still reap it below.
+                let _ = child.lock().unwrap().kill();
+            }
+            result
+        });
+        let stderr = capture_rustc_stderr(stderr, metadata_sink);
+        if stderr.is_err() {
+            let _ = child.lock().unwrap().kill();
+        }
+        let stdout = stdout.join();
+        // Neither reader needs the child lock after joining. Holding it during
+        // wait before this point could block a reader that needs to kill rustc.
+        let status = child.lock().unwrap().wait();
+        let stdout = stdout.map_err(|_| anyhow::anyhow!("rustc stdout reader panicked"))?;
+        Ok((
+            status?,
+            stdout.context("reading rustc stdout")?,
+            stderr.context("reading rustc stderr")?,
+        ))
     })
 }
 
@@ -724,6 +748,49 @@ mod tests {
     // Unix mode bits; the portable read-only tests use `make_readonly`.
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    struct FailingPipe<R>(R);
+
+    #[cfg(unix)]
+    impl<R: Read> Read for FailingPipe<R> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            // Wait for the child to be running before injecting the read error.
+            self.0.read(output)?;
+            Err(io::Error::other("injected pipe read failure"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn either_pipe_read_failure_kills_and_reaps_the_child() {
+        for fail_stdout in [false, true] {
+            let mut child = Command::new("sh")
+                // exec avoids descendants retaining the pipes after the kill.
+                // The timeout also bounds the test if killing regresses.
+                .args([
+                    "-c",
+                    "printf 'ready\\n'; printf 'ready\\n' >&2; exec sleep 10",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let started = std::time::Instant::now();
+            let result = if fail_stdout {
+                capture_rustc_output(&mut child, FailingPipe(stdout), stderr, None)
+            } else {
+                capture_rustc_output(&mut child, stdout, FailingPipe(stderr), None)
+            };
+            let error = result.err().expect("a pipe read error must be returned");
+            assert!(format!("{error:#}").contains("injected pipe read failure"));
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
 
     struct MetadataReader {
         input: Cursor<Vec<u8>>,

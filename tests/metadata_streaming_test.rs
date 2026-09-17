@@ -73,7 +73,8 @@ fn miss_and_verified_hit_emit_metadata_once_and_preserve_large_diagnostics() {
         metadata[0]["artifact"],
         project
             .path()
-            .join("out/libmetadata_fixture.rmeta")
+            .join("out")
+            .join("libmetadata_fixture.rmeta")
             .to_string_lossy()
             .as_ref()
     );
