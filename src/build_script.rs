@@ -434,6 +434,9 @@ struct Environment {
     manifest_dir: PathBuf,
     /// Longest first, so nested roots map before their parents.
     mappings: Vec<(PathBuf, &'static str)>,
+    /// `KACHE_BASE_DIR`, in both spellings when it is reached through a
+    /// symlink. See [`remap_flag_base_dirs`].
+    base_dirs: Vec<PathBuf>,
 }
 
 impl Environment {
@@ -469,11 +472,28 @@ impl Environment {
             .collect();
         mappings.extend(canonical);
         mappings.sort_by_key(|(root, _)| std::cmp::Reverse(root.as_os_str().len()));
+        let mut base_dirs: Vec<PathBuf> = base_dir_root(std::env::var_os("KACHE_BASE_DIR"))
+            .into_iter()
+            .collect();
+        if let Some(canonical) = base_dirs
+            .first()
+            .and_then(|base| std::fs::canonicalize(base).ok())
+            .filter(|canonical| !base_dirs.contains(canonical))
+        {
+            base_dirs.push(canonical);
+        }
         Ok(Self {
             out_dir,
             manifest_dir,
             mappings,
+            base_dirs,
         })
+    }
+
+    /// Normalize a variable's value for the key: the mapped roots, plus the
+    /// base dir where a path-remapping flag names it.
+    fn normalize_value(&self, text: &[u8]) -> Vec<u8> {
+        self.normalize(&remap_flag_base_dirs(text, &self.base_dirs))
     }
 
     fn normalize(&self, text: &[u8]) -> Vec<u8> {
@@ -513,7 +533,9 @@ impl Environment {
         let needles: Vec<&[u8]> = self
             .mappings
             .iter()
-            .map(|(root, _)| root.as_os_str().as_encoded_bytes())
+            .map(|(root, _)| root.as_os_str())
+            .chain(self.base_dirs.iter().map(|base| base.as_os_str()))
+            .map(std::ffi::OsStr::as_encoded_bytes)
             .collect();
         for (path, _) in files {
             let contents = std::fs::read(path)?;
@@ -526,6 +548,48 @@ impl Environment {
         }
         Ok(true)
     }
+}
+
+/// The checkout root declared relocatable with `KACHE_BASE_DIR`. A relative
+/// value or `/` is ignored: neither names a checkout.
+fn base_dir_root(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let base = PathBuf::from(value?);
+    (base.is_absolute() && base.parent().is_some()).then_some(base)
+}
+
+/// Flags that only change how paths are written into the output. The source
+/// side of each names a prefix to rewrite; nothing is read from it.
+const PATH_REMAP_FLAGS: &[&str] = &[
+    "-ffile-prefix-map=",
+    "-fdebug-prefix-map=",
+    "-fmacro-prefix-map=",
+    "-fprofile-prefix-map=",
+    "--remap-path-prefix=",
+    "--remap-path-prefix ",
+    "--remap-path-prefix\x1f",
+];
+
+/// Replace a base dir with `${KACHE_BASE_DIR}` where it is the source of a
+/// path-remapping flag, so `CFLAGS=-ffile-prefix-map=<checkout>=.` keys the
+/// same in every checkout.
+///
+/// Only those flags. A build script cannot report which files it reads
+/// through a path in a variable, so `-I<checkout>/include` must keep the
+/// checkout in the key: two checkouts at different commits would otherwise
+/// share a key and restore output built against the other's headers.
+fn remap_flag_base_dirs(text: &[u8], base_dirs: &[PathBuf]) -> Vec<u8> {
+    let mut text = text.to_vec();
+    for base in base_dirs {
+        for flag in PATH_REMAP_FLAGS {
+            let mut from = flag.as_bytes().to_vec();
+            from.extend_from_slice(base.as_os_str().as_encoded_bytes());
+            from.push(b'=');
+            let mut to = flag.as_bytes().to_vec();
+            to.extend_from_slice(b"${KACHE_BASE_DIR}=");
+            text = replace_all(&text, &from, &to);
+        }
+    }
+    text
 }
 
 /// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out` back to `<target>`.
@@ -649,9 +713,9 @@ fn cargo_environment(environment: &Environment) -> BTreeMap<String, Option<Strin
     names
         .into_iter()
         .map(|name| {
-            let value = std::env::var(&name)
-                .ok()
-                .map(|value| environment.normalize_str(&value));
+            let value = std::env::var(&name).ok().map(|value| {
+                String::from_utf8_lossy(&environment.normalize_value(value.as_bytes())).into_owned()
+            });
             (name, value)
         })
         .collect()
@@ -738,7 +802,7 @@ impl Run {
                 Some(value) => fold(
                     &mut hasher,
                     "env_value",
-                    &self.environment.normalize(value.as_encoded_bytes()),
+                    &self.environment.normalize_value(value.as_encoded_bytes()),
                 ),
                 None => fold(&mut hasher, "env_absent", b""),
             }
@@ -1328,6 +1392,7 @@ mod tests {
             out_dir: out_dir.to_path_buf(),
             manifest_dir: manifest_dir.to_path_buf(),
             mappings,
+            base_dirs: Vec::new(),
         }
     }
 
@@ -1372,6 +1437,7 @@ mod tests {
                     "${KACHE_TARGET_DIR}",
                 ),
             ],
+            base_dirs: Vec::new(),
         };
         let excluded = package_exclusions(package, &environment);
         assert_eq!(
@@ -1661,6 +1727,125 @@ mod tests {
             manifest_roots,
             usize::from(std::fs::canonicalize(&real).unwrap() != real) + 1,
             "a root that is already canonical is mapped once"
+        );
+    }
+
+    #[test]
+    fn base_dir_root_accepts_only_an_absolute_checkout() {
+        let root = if cfg!(windows) { r"C:\\" } else { "/" };
+        let checkout = if cfg!(windows) {
+            r"C:\\work\\app"
+        } else {
+            "/work/app"
+        };
+        assert_eq!(
+            base_dir_root(Some(checkout.into())),
+            Some(PathBuf::from(checkout))
+        );
+        assert_eq!(base_dir_root(Some("work/app".into())), None);
+        assert_eq!(base_dir_root(Some(root.into())), None);
+        assert_eq!(base_dir_root(Some("".into())), None);
+        assert_eq!(base_dir_root(None), None);
+    }
+
+    #[test]
+    fn remap_flag_base_dirs_rewrites_only_path_remapping_sources() {
+        let base = PathBuf::from("/work/app");
+        let bases = [base.clone()];
+        let remap =
+            |text: &str| String::from_utf8(remap_flag_base_dirs(text.as_bytes(), &bases)).unwrap();
+
+        // Every remapping flag, in both rustc spellings.
+        for flag in [
+            "-ffile-prefix-map=",
+            "-fdebug-prefix-map=",
+            "-fmacro-prefix-map=",
+            "-fprofile-prefix-map=",
+            "--remap-path-prefix=",
+            "--remap-path-prefix ",
+            "--remap-path-prefix\x1f",
+        ] {
+            assert_eq!(
+                remap(&format!("{flag}/work/app=.")),
+                format!("{flag}${{KACHE_BASE_DIR}}=."),
+                "{flag:?}"
+            );
+        }
+        // A flag through which the compiler reads files keeps the checkout.
+        assert_eq!(remap("-I/work/app/include"), "-I/work/app/include");
+        // Only the whole root, never a longer sibling or a nested path.
+        assert_eq!(
+            remap("-ffile-prefix-map=/work/apps=."),
+            "-ffile-prefix-map=/work/apps=."
+        );
+        assert_eq!(
+            remap("-ffile-prefix-map=/work/app/src=."),
+            "-ffile-prefix-map=/work/app/src=."
+        );
+        // Every occurrence, with and without a declared base.
+        assert_eq!(
+            remap("-ffile-prefix-map=/work/app=. -fdebug-prefix-map=/work/app=."),
+            "-ffile-prefix-map=${KACHE_BASE_DIR}=. -fdebug-prefix-map=${KACHE_BASE_DIR}=."
+        );
+        assert_eq!(
+            String::from_utf8(remap_flag_base_dirs(b"-ffile-prefix-map=/work/app=.", &[])).unwrap(),
+            "-ffile-prefix-map=/work/app=."
+        );
+    }
+
+    #[test]
+    fn a_base_dir_keys_the_same_across_checkouts_only_in_remapping_flags() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut remapped = Vec::new();
+        let mut included = Vec::new();
+        for checkout in ["clone-a", "clone-b"] {
+            let checkout = dir.path().join(checkout);
+            let out = checkout.join("target/release/build/libz-sys-1234/out");
+            std::fs::create_dir_all(&out).unwrap();
+            let manifest = dir.path().join("registry/libz-sys");
+            std::fs::create_dir_all(&manifest).unwrap();
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe {
+                std::env::set_var("OUT_DIR", &out);
+                std::env::set_var("CARGO_MANIFEST_DIR", &manifest);
+                std::env::set_var("KACHE_BASE_DIR", &checkout);
+                std::env::remove_var("CARGO_HOME");
+            }
+            let environment = Environment::capture();
+            unsafe {
+                std::env::remove_var("OUT_DIR");
+                std::env::remove_var("CARGO_MANIFEST_DIR");
+                std::env::remove_var("KACHE_BASE_DIR");
+            }
+            let environment = environment.unwrap();
+            // Both spellings of a symlinked checkout, each once.
+            let canonical = std::fs::canonicalize(&checkout).unwrap();
+            assert!(environment.base_dirs.contains(&checkout));
+            assert!(environment.base_dirs.contains(&canonical));
+            assert_eq!(
+                environment.base_dirs.len(),
+                1 + usize::from(canonical != checkout)
+            );
+            let value = |text: String| {
+                String::from_utf8(environment.normalize_value(text.as_bytes())).unwrap()
+            };
+            remapped.push(value(format!("-ffile-prefix-map={}=.", checkout.display())));
+            included.push(value(format!("-I{}/include", checkout.display())));
+            // An output that spells the checkout cannot move to another one.
+            let spelled = out.join("paths.txt");
+            std::fs::write(&spelled, format!("src={}/vendor", checkout.display())).unwrap();
+            assert!(
+                !environment
+                    .out_dir_is_portable(&[(spelled, "paths.txt".into())])
+                    .unwrap()
+            );
+        }
+        assert_eq!(remapped[0], "-ffile-prefix-map=${KACHE_BASE_DIR}=.");
+        assert_eq!(remapped[0], remapped[1]);
+        assert_ne!(
+            included[0], included[1],
+            "headers read from a checkout stay in the key"
         );
     }
 
