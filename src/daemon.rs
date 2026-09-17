@@ -4262,7 +4262,7 @@ impl Daemon {
 
     async fn packed_prefetch_list(
         &self,
-        backend: &dyn crate::remote_backend::RemoteBackend,
+        v3: &crate::cache_remote::V3Remote,
         prefix: &str,
     ) -> Result<Vec<String>> {
         let breaker = self
@@ -4291,7 +4291,7 @@ impl Daemon {
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
         let result = deadline
-            .run("pack catalog LIST", backend.list(prefix))
+            .run("pack catalog LIST", v3.list_prefetch_objects(prefix))
             .await;
         drop(semaphore);
         drop(gate);
@@ -4310,7 +4310,7 @@ impl Daemon {
 
     async fn packed_prefetch_get(
         &self,
-        backend: &dyn crate::remote_backend::RemoteBackend,
+        v3: &crate::cache_remote::V3Remote,
         key: &str,
         max_bytes: u64,
         stage: &'static str,
@@ -4340,7 +4340,9 @@ impl Daemon {
         self.prefetch_stats
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
-        let result = deadline.run(stage, backend.get(key, Some(max_bytes))).await;
+        let result = deadline
+            .run(stage, v3.get_prefetch_object(key, max_bytes))
+            .await;
         drop(semaphore);
         drop(gate);
         match result {
@@ -4367,7 +4369,7 @@ impl Daemon {
     async fn try_packed_prefetch(
         self: &Arc<Self>,
         context: &PackPrefetchContext,
-        backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
+        v3: &Arc<crate::cache_remote::V3Remote>,
         remote: &crate::config::RemoteConfig,
         candidates: &[(String, String, PathBuf)],
         bytes_at_plan_start: u64,
@@ -4386,7 +4388,7 @@ impl Daemon {
                 }
             };
         let objects = match self
-            .packed_prefetch_list(backend.as_ref(), &catalog_prefix)
+            .packed_prefetch_list(v3.as_ref(), &catalog_prefix)
             .await
         {
             Ok(objects) => objects,
@@ -4423,7 +4425,7 @@ impl Daemon {
         };
         let Some(catalog_object) = self
             .packed_prefetch_get(
-                backend.as_ref(),
+                v3.as_ref(),
                 &catalog_ref.object_key,
                 crate::remote_pack::MAX_CATALOG_BYTES as u64,
                 "packed-prefetch catalog GET",
@@ -4518,7 +4520,7 @@ impl Daemon {
                 let object = match pack_key {
                     Ok(key) => self
                         .packed_prefetch_get(
-                            backend.as_ref(),
+                            v3.as_ref(),
                             &key,
                             pack_ref.pack_bytes,
                             "packed-prefetch pack GET",
@@ -4697,7 +4699,7 @@ impl Daemon {
             Ok(v3_remote) => v3_remote,
             Err(error) => return Response::err(format!("remote backend init failed: {error:#}")),
         };
-        let backend = Arc::clone(v3_remote.backend());
+        let v3_remote = Arc::clone(v3_remote);
         let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> = v3_remote.clone();
         let bytes_at_plan_start = self.prefetch_stats.bytes_downloaded.load(Ordering::Relaxed);
 
@@ -4836,7 +4838,7 @@ impl Daemon {
                 let packed = daemon
                     .try_packed_prefetch(
                         context,
-                        &backend,
+                        &v3_remote,
                         &remote_config,
                         &keys_to_fetch,
                         bytes_at_plan_start,
@@ -14694,9 +14696,11 @@ mod tests {
                 .unwrap(),
                 later_downloaded: Notify::new(),
             });
+        daemon.set_remote_backend_for_test(backend);
+        let v3 = daemon.v3_remote().await.unwrap();
         let imported = tokio::time::timeout(
             Duration::from_secs(3),
-            daemon.try_packed_prefetch(&context, &backend, &remote, &candidates, 0),
+            daemon.try_packed_prefetch(&context, v3, &remote, &candidates, 0),
         )
         .await
         .expect("catalog and pack bodies must be released while the queue is draining");

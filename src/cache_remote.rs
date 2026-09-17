@@ -61,11 +61,9 @@ pub trait V3Prefetch: Send + Sync {
     async fn put_shard(&self, namespace: &str, shard_hash: &str, shard: &Shard) -> Result<()>;
 
     /// Object keys under `prefix` for packed prefetch discovery.
-    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn list_prefetch_objects(&self, prefix: &str) -> Result<Vec<String>>;
 
     /// One packed-prefetch object (catalog or pack), capped at `max_bytes`.
-    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_prefetch_object(&self, key: &str, max_bytes: u64) -> Result<Option<GetObject>>;
 }
 
@@ -80,6 +78,7 @@ impl V3Remote {
         Self { backend, remote }
     }
 
+    #[cfg(test)]
     pub fn backend(&self) -> &Arc<dyn RemoteBackend> {
         &self.backend
     }
