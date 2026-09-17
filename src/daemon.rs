@@ -13658,6 +13658,10 @@ mod tests {
             daemon.v3_remote().await.unwrap(),
             daemon.v3_remote().await.unwrap()
         ));
+        assert!(Arc::ptr_eq(
+            daemon.v3_remote().await.unwrap().backend(),
+            &backend
+        ));
     }
 
     struct BlockingIdentityBackend {

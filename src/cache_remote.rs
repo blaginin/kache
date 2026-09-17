@@ -78,11 +78,6 @@ impl V3Remote {
         Self { backend, remote }
     }
 
-    #[cfg(test)]
-    pub fn backend(&self) -> &Arc<dyn RemoteBackend> {
-        &self.backend
-    }
-
     fn layout(&self) -> RemoteLayout<'_> {
         RemoteLayout::new(self.backend.as_ref(), &self.remote)
     }
@@ -194,30 +189,23 @@ impl V3Remote {
     fn catalog_prefix(&self, selector: &str) -> Result<String> {
         crate::remote_pack::catalog_prefix(&self.remote.prefix, selector)
     }
+
+    pub fn backend(&self) -> &Arc<dyn RemoteBackend> {
+        &self.backend
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::remote_backend::{RemoteBackend, memory_backend};
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    fn test_remote() -> RemoteConfig {
-        RemoteConfig {
-            prefix: "artifacts".to_string(),
-            backend: crate::config::RemoteBackendConfig::Filesystem(
-                crate::config::FilesystemRemoteConfig {
-                    root: std::path::PathBuf::from("/unused"),
-                    atomic_write_dir: std::path::PathBuf::from("/unused/.staging"),
-                },
-            ),
-        }
-    }
 
     fn v3() -> (Arc<dyn RemoteBackend>, V3Remote) {
         let backend: Arc<dyn RemoteBackend> = Arc::new(memory_backend());
-        let remote = V3Remote::new(Arc::clone(&backend), test_remote());
+        let remote = V3Remote::new(
+            Arc::clone(&backend),
+            RemoteConfig::test_s3("bucket", "artifacts"),
+        );
         (backend, remote)
     }
 
@@ -341,12 +329,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn backend_accessor_returns_the_wrapped_backend() {
-        let (backend, remote) = v3();
-        assert!(Arc::ptr_eq(&backend, remote.backend()));
     }
 
     #[tokio::test]
