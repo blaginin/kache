@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -162,33 +162,42 @@ pub fn run_rustc(
         );
     }
 
-    // Spawn + `wait_with_output()` rather than `Command::output()` so the
-    // child PID is known while the compile runs — the heartbeat monitor
-    // (kunobi-ninja/kache#131) ticks against it for elapsed/ETA lines and
-    // stuck detection. `wait_with_output` reproduces `output()`'s capture
-    // semantics exactly (std drains both pipes concurrently without an extra
-    // user thread, and a capture failure surfaces instead of yielding partial
-    // buffers); `output()` also nulls stdin, matched explicitly here.
+    // Cargo can start dependent crates as soon as rustc publishes metadata.
+    // Drain both pipes while forwarding that notification before codegen ends.
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let compiler_trace = crate::phase_trace::phase("compiler");
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
     let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("executing {}", rustc.display()))?;
+    let mut child_stdout = child.stdout.take().context("capturing rustc stdout")?;
+    let child_stderr = child.stderr.take().context("capturing rustc stderr")?;
+    let captured = std::thread::scope(|scope| {
+        let stdout = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            child_stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr = capture_rustc_stderr(child_stderr, &mut io::stderr());
+        let status = child.wait();
+        let stdout = stdout
+            .join()
+            .map_err(|_| anyhow::anyhow!("rustc stdout reader panicked"))?;
+        Ok::<_, anyhow::Error>((status?, stdout?, stderr?))
+    });
     drop(compiler_trace);
     drop(response_file);
     if let Some(monitor) = monitor {
         monitor.finish();
     }
 
-    let exit_code = output.status.code().unwrap_or(1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (status, stdout, captured_stderr) =
+        captured.with_context(|| format!("executing {}", rustc.display()))?;
+
+    let exit_code = status.code().unwrap_or(1);
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&captured_stderr.all);
 
     // Detect incremental-related failures and log diagnostics
     if exit_code != 0
@@ -237,10 +246,51 @@ pub fn run_rustc(
     Ok(CompileResult {
         exit_code,
         stdout,
-        stderr,
+        stderr: String::from_utf8_lossy(&captured_stderr.replay).into_owned(),
         artifacts,
         keepalive: Vec::new(),
     })
+}
+
+struct CapturedStderr {
+    all: Vec<u8>,
+    replay: Vec<u8>,
+}
+
+fn capture_rustc_stderr(
+    reader: impl Read,
+    forwarded: &mut impl Write,
+) -> io::Result<CapturedStderr> {
+    let mut reader = BufReader::new(reader);
+    let mut captured = CapturedStderr {
+        all: Vec::new(),
+        replay: Vec::new(),
+    };
+    let mut line = Vec::new();
+    let mut forward_error = None;
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        captured.all.extend_from_slice(&line);
+        let metadata = serde_json::from_slice::<serde_json::Value>(&line).is_ok_and(|message| {
+            message["$message_type"] == "artifact" && message["emit"] == "metadata"
+        });
+        if metadata {
+            if forward_error.is_none() {
+                forward_error = forwarded
+                    .write_all(&line)
+                    .and_then(|()| forwarded.flush())
+                    .err();
+            }
+        } else {
+            captured.replay.extend_from_slice(&line);
+        }
+        line.clear();
+    }
+    // Keep draining after a forwarding failure so a full stderr pipe cannot
+    // prevent rustc from exiting while its parent waits for completion.
+    if let Some(error) = forward_error {
+        return Err(error);
+    }
+    Ok(captured)
 }
 
 /// Strip `-C incremental=...` flags from rustc arguments.
@@ -667,11 +717,98 @@ fn remove_if_readonly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
+    use std::io::Cursor;
+    use std::rc::Rc;
     // Used only by the `#[cfg(unix)]` hardlink test below, which relies on
     // Unix mode bits; the portable read-only tests use `make_readonly`.
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    struct MetadataReader {
+        input: Cursor<Vec<u8>>,
+        flushed: Rc<Cell<bool>>,
+    }
+
+    impl Read for MetadataReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.input.position() == self.input.get_ref().len() as u64 {
+                assert!(self.flushed.get(), "metadata must be forwarded before EOF");
+            }
+            self.input.read(output)
+        }
+    }
+
+    struct MetadataWriter {
+        output: Vec<u8>,
+        flushed: Rc<Cell<bool>>,
+    }
+
+    impl Write for MetadataWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.set(true);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metadata_is_forwarded_before_eof_without_duplicate_replay() {
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        let diagnostic = b"diagnostic\n";
+        let link =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rlib\",\"emit\":\"link\"}\n";
+        let input = [diagnostic.as_slice(), metadata.as_slice(), link.as_slice()].concat();
+        let flushed = Rc::new(Cell::new(false));
+        let reader = MetadataReader {
+            input: Cursor::new(input.clone()),
+            flushed: flushed.clone(),
+        };
+        let mut writer = MetadataWriter {
+            output: Vec::new(),
+            flushed,
+        };
+        let captured = capture_rustc_stderr(reader, &mut writer).unwrap();
+        assert_eq!(writer.output, metadata);
+        assert_eq!(captured.all, input);
+        assert_eq!(
+            captured.replay,
+            [diagnostic.as_slice(), link.as_slice()].concat()
+        );
+        assert_eq!(
+            parse_rustc_artifacts(&String::from_utf8(captured.all).unwrap()).len(),
+            2
+        );
+    }
+
+    struct ClosedWriter;
+
+    impl Write for ClosedWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metadata_forwarding_failure_still_drains_stderr() {
+        let mut input = Cursor::new(
+            b"{\"$message_type\":\"artifact\",\"emit\":\"metadata\"}\nremaining diagnostics\n",
+        );
+        let error = capture_rustc_stderr(&mut input, &mut ClosedWriter)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(input.position(), input.get_ref().len() as u64);
+    }
 
     /// Mark a file read-only on any platform. Unix mode bits (`from_mode`)
     /// aren't available on Windows, and `remove_if_readonly` keys off the
