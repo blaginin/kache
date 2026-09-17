@@ -100,12 +100,20 @@ impl RustcCompiler {
 
     /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.
     pub(crate) fn execute_streaming(&self, parsed: &RustcArgs) -> Result<CompileResult> {
+        self.execute_with_metadata_sink(parsed, Some(&mut std::io::stderr()))
+    }
+
+    fn execute_with_metadata_sink(
+        &self,
+        parsed: &RustcArgs,
+        metadata_sink: Option<&mut dyn std::io::Write>,
+    ) -> Result<CompileResult> {
         self.execute_with_args(
             parsed,
             &parsed.all_args,
             compile::IncrementalMode::Strip,
             None,
-            Some(&mut std::io::stderr()),
+            metadata_sink,
         )
     }
 
@@ -223,20 +231,7 @@ impl Compiler for RustcCompiler {
     }
 
     fn execute(&self, parsed: &RustcArgs) -> Result<CompileResult> {
-        // Construct the same PathNormalizer that the cache key was
-        // built with — derived from `--out-dir` so workspace_root
-        // matches across the two consumers (cache_key.rs and the
-        // `--remap-path-prefix` injection here). If they diverged,
-        // the key would represent one set of remap rules and the
-        // output binary would have been compiled with a different
-        // set, breaking the byte-for-byte invariant.
-        self.execute_with_args(
-            parsed,
-            &parsed.all_args,
-            compile::IncrementalMode::Strip,
-            None,
-            None,
-        )
+        self.execute_with_metadata_sink(parsed, None)
     }
 
     fn classify_output(&self, parsed: &RustcArgs, name: &str) -> ArtifactKind {

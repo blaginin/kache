@@ -984,7 +984,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     replay_diagnostics(
         &result.stdout,
-        &result.stderr,
+        result.pending_stderr(),
         std::io::stdout(),
         std::io::stderr(),
     );
@@ -1826,7 +1826,7 @@ fn run_cc_inner(
             let compile_time_ms = compile_start.elapsed().as_millis() as u64;
             replay_diagnostics(
                 &result.stdout,
-                &result.stderr,
+                result.pending_stderr(),
                 std::io::stdout(),
                 std::io::stderr(),
             );
@@ -5826,7 +5826,7 @@ fn cc_compile_before_key(
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
     replay_diagnostics(
         &result.stdout,
-        &result.stderr,
+        result.pending_stderr(),
         std::io::stdout(),
         std::io::stderr(),
     );

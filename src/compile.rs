@@ -20,9 +20,9 @@ pub struct CompileResult {
     pub stdout: String,
     /// Complete compiler stderr, retained for cache storage.
     pub stderr: String,
-    /// Output still owed to the caller after live metadata forwarding.
-    /// `None` means no output was forwarded.
-    pub stderr_pending: Option<String>,
+    /// Replay override after live metadata forwarding was attempted.
+    /// `None` replays full stderr; `Some("")` means nothing remains to replay.
+    pub pending_stderr: Option<String>,
     /// Full artifact set produced by this compilation.
     pub artifacts: ArtifactSet,
     /// Temp files backing `artifacts`. Held so Drop does not delete them
@@ -32,9 +32,9 @@ pub struct CompileResult {
 }
 
 impl CompileResult {
-    /// Diagnostics not already delivered while the compiler was running.
+    /// Compiler stderr selected for deferred replay.
     pub fn pending_stderr(&self) -> &str {
-        self.stderr_pending.as_deref().unwrap_or(&self.stderr)
+        self.pending_stderr.as_deref().unwrap_or(&self.stderr)
     }
 }
 
@@ -265,7 +265,7 @@ pub fn run_rustc(
         exit_code,
         stdout,
         stderr: stderr.into_owned(),
-        stderr_pending: forwarding_metadata
+        pending_stderr: forwarding_metadata
             .then(|| String::from_utf8_lossy(&captured_stderr.undelivered).into_owned()),
         artifacts,
         keepalive: Vec::new(),
@@ -305,8 +305,9 @@ fn capture_rustc_stderr(
             .and_then(|emit| emit.as_str())
             == Some("metadata");
         if metadata && let Some(sink) = metadata_sink.as_deref_mut() {
-            // Like diagnostic replay, a closed parent stream must not turn a
-            // completed compile into a spawn failure and trigger recompilation.
+            // A write/flush error may follow partial or complete delivery.
+            // Replaying the line could corrupt JSON or duplicate notification;
+            // treat sink errors as best-effort, like ordinary diagnostic replay.
             let _ = sink.write_all(&line).and_then(|()| sink.flush());
         } else {
             captured.undelivered.extend_from_slice(&line);
@@ -781,28 +782,65 @@ mod tests {
         assert_eq!(captured.artifacts.len(), 2);
     }
 
-    struct ClosedWriter;
+    struct FailingMetadataWriter {
+        output: Vec<u8>,
+        capacity: usize,
+    }
 
-    impl Write for ClosedWriter {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::ErrorKind::BrokenPipe.into())
+    impl Write for FailingMetadataWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let remaining = self.capacity - self.output.len();
+            if remaining == 0 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let count = remaining.min(bytes.len());
+            self.output.extend_from_slice(&bytes[..count]);
+            Ok(count)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            Err(io::ErrorKind::BrokenPipe.into())
         }
     }
 
     #[test]
-    fn metadata_forwarding_failure_still_drains_stderr() {
+    fn metadata_sink_failure_drains_stderr_without_retrying_delivery() {
         let metadata = b"{\"$message_type\":\"artifact\",\"emit\":\"metadata\"}\n";
         let diagnostics = b"remaining diagnostics\n";
         let bytes = [metadata.as_slice(), metadata.as_slice(), diagnostics].concat();
-        let mut input = Cursor::new(&bytes);
-        let captured = capture_rustc_stderr(&mut input, Some(&mut ClosedWriter)).unwrap();
-        assert_eq!(captured.verbatim, bytes);
-        assert_eq!(captured.undelivered, diagnostics);
-        assert_eq!(input.position(), bytes.len() as u64);
+        // No bytes written, a partial write, and complete writes with failed flushes.
+        for capacity in [0, metadata.len() / 2, 2 * metadata.len()] {
+            let mut input = Cursor::new(&bytes);
+            let mut sink = FailingMetadataWriter {
+                output: Vec::new(),
+                capacity,
+            };
+            let captured = capture_rustc_stderr(&mut input, Some(&mut sink)).unwrap();
+            assert_eq!(sink.output, bytes[..capacity]);
+            assert_eq!(captured.verbatim, bytes);
+            assert_eq!(captured.undelivered, diagnostics);
+            assert_eq!(input.position(), bytes.len() as u64);
+        }
+    }
+
+    #[test]
+    fn pending_stderr_selects_the_override_including_an_empty_override() {
+        for (pending, expected) in [
+            (None, "complete stderr"),
+            (Some("remaining"), "remaining"),
+            (Some(""), ""),
+        ] {
+            let result = CompileResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: "complete stderr".to_owned(),
+                pending_stderr: pending.map(str::to_owned),
+                artifacts: ArtifactSet::empty(),
+                keepalive: Vec::new(),
+            };
+            assert_eq!(result.pending_stderr(), expected);
+            assert_eq!(result.stderr, "complete stderr");
+        }
     }
 
     #[test]
