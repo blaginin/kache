@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, RwLock};
 
+use crate::cache_remote::V3Prefetch;
 use crate::config::{Config, UPLOAD_SPOOL_MAX_JOBS};
 use crate::events;
 use crate::remote_resilience::{
@@ -2554,8 +2555,7 @@ impl Daemon {
         namespace: &str,
         shard_hash: &str,
     ) -> Result<Option<crate::remote::Shard>> {
-        let remote = self
-            .config
+        self.config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
@@ -2564,11 +2564,11 @@ impl Daemon {
             .remote_breaker
             .try_acquire(RemoteOperation::ShardGet)
             .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
-        let backend = match deadline
-            .run("planner backend initialization", self.get_remote_backend())
+        let v3 = match deadline
+            .run("planner backend initialization", self.v3_remote())
             .await
         {
-            Ok(backend) => backend,
+            Ok(v3) => v3,
             Err(error) => {
                 let class = classify_remote_error(&error);
                 breaker.failure(class, &format!("{error:#}"));
@@ -2592,15 +2592,7 @@ impl Daemon {
             }
         };
         let result = deadline
-            .run(
-                "planner shard GET",
-                crate::remote::download_shard(
-                    backend.as_ref(),
-                    &remote.prefix,
-                    namespace,
-                    shard_hash,
-                ),
-            )
+            .run("planner shard GET", v3.get_shard(namespace, shard_hash))
             .await;
         drop(semaphore);
         match &result {
@@ -2638,8 +2630,7 @@ impl Daemon {
         &self,
         manifest_key: &str,
     ) -> Result<SpeculativeManifestOutcome> {
-        let remote = self
-            .config
+        self.config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
@@ -2651,8 +2642,8 @@ impl Daemon {
         }
 
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let backend = deadline
-            .run("planner backend initialization", self.get_remote_backend())
+        let v3 = deadline
+            .run("planner backend initialization", self.v3_remote())
             .await?;
 
         // Identity lookahead is speculative work. Put it behind the same
@@ -2687,14 +2678,7 @@ impl Daemon {
             return Ok(SpeculativeManifestOutcome::NotAdmitted);
         };
         let result = deadline
-            .run(
-                "planner manifest GET",
-                crate::remote::try_download_manifest(
-                    backend.as_ref(),
-                    &remote.prefix,
-                    manifest_key,
-                ),
-            )
+            .run("planner manifest GET", v3.get_build_manifest(manifest_key))
             .await;
         drop(semaphore);
         drop(gate);
@@ -2716,17 +2700,16 @@ impl Daemon {
         manifest_key: &str,
         breaker: BreakerPermit,
     ) -> Result<Option<crate::remote::BuildManifest>> {
-        let remote = self
-            .config
+        self.config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let backend = match deadline
-            .run("planner backend initialization", self.get_remote_backend())
+        let v3 = match deadline
+            .run("planner backend initialization", self.v3_remote())
             .await
         {
-            Ok(backend) => backend,
+            Ok(v3) => v3,
             Err(error) => {
                 let class = classify_remote_error(&error);
                 breaker.failure(class, &format!("{error:#}"));
@@ -2750,14 +2733,7 @@ impl Daemon {
             }
         };
         let result = deadline
-            .run(
-                "planner manifest GET",
-                crate::remote::try_download_manifest(
-                    backend.as_ref(),
-                    &remote.prefix,
-                    manifest_key,
-                ),
-            )
+            .run("planner manifest GET", v3.get_build_manifest(manifest_key))
             .await;
         drop(semaphore);
         match &result {
@@ -6953,20 +6929,20 @@ async fn manifest_prefetch(
     namespace: Option<&str>,
     lock_path: &Path,
 ) -> usize {
-    let Some(remote) = &daemon.config.remote else {
+    let Some(_) = &daemon.config.remote else {
         return 0;
     };
 
     let initialization_deadline =
         RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
-    let backend = match initialization_deadline
+    let v3 = match initialization_deadline
         .run(
             "startup prefetch backend initialization",
-            daemon.get_remote_backend(),
+            daemon.v3_remote(),
         )
         .await
     {
-        Ok(b) => b,
+        Ok(v3) => v3,
         Err(e) => {
             tracing::warn!("manifest prefetch: remote backend init failed: {e}");
             return 0;
@@ -6983,7 +6959,7 @@ async fn manifest_prefetch(
 
     if let Some(namespace) = namespace {
         if lock_path.exists() {
-            match shard_prefetch(daemon, backend, &remote.prefix, namespace, lock_path).await {
+            match shard_prefetch(daemon, v3, namespace, lock_path).await {
                 Ok(n) => {
                     tracing::info!("shard prefetch: queued {n} keys from shards");
                     return n;
@@ -7008,19 +6984,17 @@ fn identity_prefetch_satisfied(count: usize) -> bool {
 /// from the remote in parallel, collect cache keys.
 async fn shard_prefetch(
     daemon: &Arc<Daemon>,
-    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
-    prefix: &str,
+    v3: &Arc<crate::cache_remote::V3Remote>,
     namespace: &str,
     lock_path: &std::path::Path,
 ) -> anyhow::Result<usize> {
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
-    shard_prefetch_for_deps(daemon, backend, prefix, namespace, &deps).await
+    shard_prefetch_for_deps(daemon, v3, namespace, &deps).await
 }
 
 async fn shard_prefetch_for_deps(
     daemon: &Arc<Daemon>,
-    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
-    prefix: &str,
+    v3: &Arc<crate::cache_remote::V3Remote>,
     namespace: &str,
     deps: &[(String, String)],
 ) -> anyhow::Result<usize> {
@@ -7036,9 +7010,8 @@ async fn shard_prefetch_for_deps(
     // Download all shards in parallel
     let mut handles = Vec::new();
     for (hash, _entries) in &shard_set.shards {
-        let b = Arc::clone(backend);
+        let v = Arc::clone(v3);
         let d = Arc::clone(daemon);
-        let p = prefix.to_string();
         let ns = namespace.to_string();
         let h = hash.clone();
         handles.push(tokio::spawn(async move {
@@ -7062,12 +7035,7 @@ async fn shard_prefetch_for_deps(
                     return Err(error);
                 }
             };
-            let result = deadline
-                .run(
-                    "shard GET",
-                    crate::remote::download_shard(b.as_ref(), &p, &ns, &h),
-                )
-                .await;
+            let result = deadline.run("shard GET", v.get_shard(&ns, &h)).await;
             drop(semaphore);
             match &result {
                 Ok(_) => breaker.success(),
@@ -15955,8 +15923,10 @@ mod tests {
 
         let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
+        let v3 = daemon.v3_remote().await.expect("v3 remote");
 
-        let count = shard_prefetch(&daemon, &client, "prefix", "ns", &lock)
+        let count = shard_prefetch(&daemon, v3, "ns", &lock)
             .await
             .expect("shard prefetch should succeed");
         assert_eq!(count, 0, "no shards matched -> nothing queued");
@@ -15994,7 +15964,8 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(client.clone()).is_ok());
 
-        let queued = shard_prefetch_for_deps(&daemon, &client, "prefix", "workspace", &deps)
+        let v3 = daemon.v3_remote().await.expect("v3 remote");
+        let queued = shard_prefetch_for_deps(&daemon, v3, "workspace", &deps)
             .await
             .expect("seeded shard prefetch");
         assert_eq!(queued, shard_set.shards.len());

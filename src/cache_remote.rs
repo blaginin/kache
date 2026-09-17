@@ -52,12 +52,10 @@ pub trait CacheRemote: Send + Sync {
 /// packed-prefetch catalogs and packs. Only the v3 layout has them.
 #[async_trait]
 pub trait V3Prefetch: Send + Sync {
-    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_build_manifest(&self, manifest_key: &str) -> Result<Option<BuildManifest>>;
 
     async fn put_build_manifest(&self, manifest_key: &str, manifest: &BuildManifest) -> Result<()>;
 
-    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_shard(&self, namespace: &str, shard_hash: &str) -> Result<Option<Shard>>;
 
     async fn put_shard(&self, namespace: &str, shard_hash: &str, shard: &Shard) -> Result<()>;
