@@ -15906,9 +15906,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shard_prefetch_all_shards_missing_returns_zero() {
-        // A Cargo.lock with two deps -> compute_shards -> one download_shard GET
-        // per shard. The mock NoSuchKey-404s every shard, so none match and the
-        // prefetch queues nothing (Ok(0)). Covers shard computation + parallel
+        // A Cargo.lock with two deps -> compute_shards -> one shard GET per
+        // shard. The empty memory backend has no shard objects, so none match
+        // and the prefetch queues nothing (Ok(0)). Covers shard computation + parallel
         // shard download + collection (miss path).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -15932,43 +15932,95 @@ mod tests {
         assert_eq!(count, 0, "no shards matched -> nothing queued");
     }
 
+    /// Seed one local store entry per dep and a remote shard object listing
+    /// those entries under `prefix`/`namespace`. Returns the memory backend
+    /// and the number of shard entries seeded.
+    async fn seed_prefetch_shards(
+        config: &Config,
+        dir: &Path,
+        namespace: &str,
+        deps: &[(String, String)],
+    ) -> (Arc<dyn crate::remote_backend::RemoteBackend>, usize) {
+        let shard_set = crate::shards::compute_shards(namespace, deps);
+        assert!(
+            shard_set.shards.len() >= 2,
+            "test deps must span at least two shards"
+        );
+        let client = test_remote_backend();
+        let mut seeded = 0;
+        for (hash, entries) in &shard_set.shards {
+            let mut shard = crate::remote::Shard {
+                version: 3,
+                entries: Vec::new(),
+            };
+            for (name, version) in entries {
+                let key = test_cache_key(&format!("seeded-shard-prefetch-{name}-{version}"));
+                seed_store_entry(config, &key, name, dir);
+                shard.entries.push(crate::remote::ShardEntry {
+                    cache_key: key,
+                    crate_name: name.clone(),
+                    compile_time_ms: Some(5000),
+                    artifact_size: Some(100),
+                });
+                seeded += 1;
+            }
+            put_test_object(
+                &client,
+                &crate::remote::shard_object_key("prefix", namespace, hash),
+                &serde_json::to_vec(&shard).unwrap(),
+            )
+            .await;
+        }
+        (client, seeded)
+    }
+
     #[tokio::test]
     async fn shard_prefetch_for_deps_returns_seeded_shard_entries() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
-        let key = test_cache_key("seeded-shard-prefetch");
-        seed_store_entry(&config, &key, "serde", dir.path());
-
-        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
-        let shard_set = crate::shards::compute_shards("workspace", &deps);
-        assert!(!shard_set.shards.is_empty());
-        let client = test_remote_backend();
-        for (hash, _) in &shard_set.shards {
-            let shard = crate::remote::Shard {
-                version: 3,
-                entries: vec![crate::remote::ShardEntry {
-                    cache_key: key.clone(),
-                    crate_name: "serde".into(),
-                    compile_time_ms: Some(5000),
-                    artifact_size: Some(100),
-                }],
-            };
-            put_test_object(
-                &client,
-                &crate::remote::shard_object_key("prefix", "workspace", hash),
-                &serde_json::to_vec(&shard).unwrap(),
-            )
-            .await;
-        }
+        let deps = vec![
+            ("serde".to_string(), "1.0.0".to_string()),
+            ("tokio".to_string(), "1.0.0".to_string()),
+            ("anyhow".to_string(), "1.0.0".to_string()),
+        ];
+        let (client, seeded) = seed_prefetch_shards(&config, dir.path(), "workspace", &deps).await;
+        assert_eq!(seeded, 3);
         let daemon = Arc::new(Daemon::new(config));
-        assert!(daemon.remote_backend.set(client.clone()).is_ok());
+        assert!(daemon.remote_backend.set(client).is_ok());
 
         let v3 = daemon.v3_remote().await.expect("v3 remote");
         let queued = shard_prefetch_for_deps(&daemon, v3, "workspace", &deps)
             .await
             .expect("seeded shard prefetch");
-        assert_eq!(queued, shard_set.shards.len());
+        assert_eq!(queued, 3, "one queued key per seeded shard entry");
+    }
+
+    #[tokio::test]
+    async fn shard_prefetch_reads_cargo_lock_and_returns_seeded_shard_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"tokio\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"anyhow\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
+        assert_eq!(deps.len(), 3);
+        let (client, seeded) = seed_prefetch_shards(&config, dir.path(), "ns", &deps).await;
+        assert_eq!(seeded, 3);
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let v3 = daemon.v3_remote().await.expect("v3 remote");
+        let count = shard_prefetch(&daemon, v3, "ns", &lock)
+            .await
+            .expect("seeded shard prefetch from Cargo.lock");
+        assert_eq!(count, 3, "one queued key per Cargo.lock package");
     }
 
     // ── New protocol types serde tests ────────────────────────────
