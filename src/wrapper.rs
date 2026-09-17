@@ -205,6 +205,13 @@ fn incremental_fast_path_allowed(
     !has_refuse_reasons && !source_excluded && !skip_user_facing
 }
 
+/// Whether this unit is refused caching outright: the compiler's own refusal
+/// list, or a codegen backend dylib kache will not replay. Either one also
+/// keeps the unit off the managed-incremental fast path.
+fn unit_refuses_caching(has_refuse_reasons: bool, untrusted_codegen_backend: bool) -> bool {
+    has_refuse_reasons || untrusted_codegen_backend
+}
+
 fn incremental_cleanup_enabled(config: &Config) -> bool {
     config.clean_incremental && !config.preserve_incremental
 }
@@ -2848,6 +2855,12 @@ fn run_parsed_rustc(
     // path. In particular, changing an exclusion or executable-cache policy
     // must take effect immediately even when this unit was already active.
     let refuse = compiler.refuse_reasons(args);
+    // A codegen backend loaded from a dylib can write files rustc never
+    // reports (cuda-oxide writes device artifacts next to the crate), and a
+    // hit would restore the artifacts without them. Such compiles bypass the
+    // cache unless the user trusts the backend.
+    let untrusted_codegen_backend =
+        untrusted_codegen_backend(args.codegen_backend_dylib(), config.trust_codegen_backends);
     let current_dir = std::env::current_dir().ok();
     let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
@@ -2866,7 +2879,7 @@ fn run_parsed_rustc(
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
     if incremental_fast_path_allowed(
-        !refuse.is_empty(),
+        unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
         excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
     ) {
@@ -2934,6 +2947,22 @@ fn run_parsed_rustc(
             e
         );
     }
+    // Checked before the refusals below: those may hand the compile to a
+    // configured fallback cache, which would replay the same incomplete
+    // outputs.
+    if untrusted_codegen_backend.is_some() {
+        tracing::debug!("rustc codegen backend dylib not trusted; running rustc directly");
+        reset_adaptive_unit(adaptive_unit.as_ref());
+        return rustc_direct_passthrough_with_event(
+            config,
+            args,
+            crate_name,
+            &event_root,
+            start,
+            UNTRUSTED_CODEGEN_BACKEND_REASON,
+        );
+    }
+
     // Bypass the cache when the compiler tells us we can't safely cache this
     // invocation (today: only NotPrimary; future: response files, coverage,
     // time macros, etc.).
@@ -5644,6 +5673,41 @@ fn passthrough_with_event<R: Into<String>>(
     Ok(output.exit_code)
 }
 
+/// The codegen backend dylib that keeps a rustc compile out of the cache: any
+/// dylib when backends are untrusted, and a trusted one kache cannot key.
+fn untrusted_codegen_backend(backend: Option<&str>, trusted: bool) -> Option<&str> {
+    backend.filter(|backend| !trusted || !crate::args::codegen_backend_is_keyable(backend))
+}
+
+/// Passthrough reason for a rustc compile whose codegen backend dylib is not
+/// trusted. The string is a contract: reports group passthroughs by it.
+const UNTRUSTED_CODEGEN_BACKEND_REASON: &str = "unsupported|rustc codegen backend dylib (-Zcodegen-backend=<path>) may write files kache cannot restore; set cache.trust_codegen_backends and pass the backend as a path to cache it";
+
+/// Run rustc without caching and without the configured fallback, for
+/// compiles no cache can replay correctly.
+fn rustc_direct_passthrough_with_event(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    reason: &str,
+) -> Result<i32> {
+    if PRECOMPILED_EXIT.with(std::cell::Cell::get).is_some() {
+        return passthrough_with_event(config, args, crate_name, root, start, reason);
+    }
+    let output = passthrough(args, None, config.preserve_incremental)?;
+    log_passthrough_event(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        reason.to_string(),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
 /// Run the explicit preserve-incremental lane directly. Kache owns this
 /// compiler strategy; ordinary rejected invocations still use the configured
 /// fallback pipeline.
@@ -7437,6 +7501,11 @@ mod tests {
         assert!(!incremental_fast_path_allowed(false, true, false));
         assert!(!incremental_fast_path_allowed(false, false, true));
         assert!(!incremental_fast_path_allowed(true, false, false));
+        // Either refusal alone keeps a unit off the fast path.
+        assert!(!unit_refuses_caching(false, false));
+        assert!(unit_refuses_caching(true, false));
+        assert!(unit_refuses_caching(false, true));
+        assert!(unit_refuses_caching(true, true));
 
         let stripped: Vec<_> = compile::strip_incremental_flags(&args.all_args)
             .into_iter()
@@ -11301,6 +11370,27 @@ exit 0
         assert!(!cc_key_error_skips_fallback(&anyhow::anyhow!(
             "cc -E key probe exited 1"
         )));
+    }
+
+    #[test]
+    fn untrusted_codegen_backend_bypasses_unless_trusted_and_keyable() {
+        assert_eq!(untrusted_codegen_backend(None, false), None);
+        assert_eq!(untrusted_codegen_backend(None, true), None);
+        assert_eq!(
+            untrusted_codegen_backend(Some("/b/backend.so"), false),
+            Some("/b/backend.so"),
+            "an untrusted backend always bypasses"
+        );
+        assert_eq!(
+            untrusted_codegen_backend(Some("/b/backend.so"), true),
+            None,
+            "a trusted backend passed as a path is cached"
+        );
+        assert_eq!(
+            untrusted_codegen_backend(Some("backend.so"), true),
+            Some("backend.so"),
+            "a trusted bare file name cannot be keyed"
+        );
     }
 
     #[cfg(unix)]
