@@ -98,6 +98,17 @@ impl RustcCompiler {
         name == "rustc" || name.starts_with("rustc") || name == "clippy-driver"
     }
 
+    /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.
+    pub(crate) fn execute_streaming(&self, parsed: &RustcArgs) -> Result<CompileResult> {
+        self.execute_with_args(
+            parsed,
+            &parsed.all_args,
+            compile::IncrementalMode::Strip,
+            None,
+            Some(&mut std::io::stderr()),
+        )
+    }
+
     /// Execute rustc with Kache-owned isolated incremental state while keeping
     /// every other normal compile behavior (path remapping, opcounts,
     /// heartbeat monitoring, diagnostics, and output discovery).
@@ -111,6 +122,7 @@ impl RustcCompiler {
             isolated_args,
             compile::IncrementalMode::PreserveIsolated,
             None,
+            Some(&mut std::io::stderr()),
         )
     }
 
@@ -127,6 +139,7 @@ impl RustcCompiler {
             isolated_args,
             compile::IncrementalMode::PreserveIsolated,
             Some(true),
+            Some(&mut std::io::stderr()),
         )
     }
 
@@ -136,6 +149,7 @@ impl RustcCompiler {
         all_args: &[String],
         incremental_mode: compile::IncrementalMode,
         skip_remap_override: Option<bool>,
+        metadata_sink: Option<&mut dyn std::io::Write>,
     ) -> Result<CompileResult> {
         // The invocation and key must use the same path-normalization rules.
         let workspace_root = parsed.path_normalization_root();
@@ -172,6 +186,7 @@ impl RustcCompiler {
             skip_remap,
             &path_normalizer,
             incremental_mode,
+            metadata_sink,
         )
     }
 }
@@ -219,6 +234,7 @@ impl Compiler for RustcCompiler {
             parsed,
             &parsed.all_args,
             compile::IncrementalMode::Strip,
+            None,
             None,
         )
     }
