@@ -1238,6 +1238,93 @@ diff --git a/hello.txt b/hello.txt
         );
     }
 
+    /// The shipped cuda-oxide scenario runs upstream's GPU-less examples
+    /// compile: the pinned nightly installed untimed per clone, every example
+    /// workspace sharing the objdir as CARGO_TARGET_DIR, pinned by commit.
+    #[test]
+    fn shipped_cuda_oxide_profile_runs_upstream_examples_compile() {
+        let p = BenchProfile::load(&repo_profile("cuda-oxide")).expect("cuda-oxide.toml loads");
+        assert_eq!(p.name, "bench-cuda-oxide");
+        assert_eq!(p.objdir, "target");
+        assert_eq!(p.repo, "https://github.com/NVlabs/cuda-oxide.git");
+        assert_eq!(p.git_ref.len(), 40, "pin by commit SHA, not a tag");
+        assert!(
+            p.files.is_empty(),
+            "cuda-oxide owns its rust-toolchain.toml"
+        );
+        assert!(
+            p.env.is_empty(),
+            "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"
+        );
+        let prepare = p
+            .prepare_command(Path::new("/k"))
+            .expect("prepare installs the pinned toolchain");
+        assert!(
+            prepare.starts_with("unset RUSTUP_TOOLCHAIN"),
+            "an inherited toolchain override breaks the rustc-dev backend: {prepare}"
+        );
+        let build = p.build_command(Path::new("/k"));
+        assert!(
+            build.contains("scripts/smoketest.sh --compile-only"),
+            "{build}"
+        );
+        assert!(
+            build.contains("export CARGO_TARGET_DIR=\"$repo/target\""),
+            "{build}"
+        );
+        assert!(build.contains("KACHE_BASE_DIR"), "{build}");
+        assert!(build.contains("unset RUSTUP_TOOLCHAIN"), "{build}");
+        assert!(
+            build.contains("rm -rf \"$repo/crates/rustc-codegen-cuda/target\""),
+            "the backend target dir sits outside the objdir and must be rebuilt per phase"
+        );
+        assert!(
+            build.contains("export CARGO_TERM_COLOR=never"),
+            "colour codes hide the smoketest's compile-error markers"
+        );
+    }
+
+    /// The patched cuda-oxide arm runs the same job as `bench-cuda-oxide` with
+    /// one multi-file patch that declares every backend output, and trusts
+    /// the backend so kache caches those compiles.
+    #[test]
+    fn shipped_cuda_oxide_patched_profile_matches_the_plain_arm_plus_patch() {
+        let plain = BenchProfile::load(&repo_profile("cuda-oxide")).expect("cuda-oxide.toml loads");
+        let p = BenchProfile::load(&repo_profile("cuda-oxide-patched"))
+            .expect("cuda-oxide-patched.toml loads");
+        assert_eq!(p.name, "bench-cuda-oxide-patched");
+        assert_eq!(
+            (&p.repo, &p.git_ref, &p.objdir),
+            (&plain.repo, &plain.git_ref, &plain.objdir)
+        );
+        assert_eq!(p.files.len(), 1);
+        let patch = &p.files[0];
+        assert_eq!(patch.mode, FileMode::Patch);
+        let rel = patch
+            .content_file
+            .as_deref()
+            .expect("patch comes from a file");
+        let payload = std::fs::read_to_string(
+            repo_profile("cuda-oxide-patched")
+                .parent()
+                .unwrap()
+                .join(rel),
+        )
+        .expect("patch file exists");
+        assert!(payload.contains("crates/cargo-oxide/src/commands/side_files.rs"));
+        assert!(payload.contains("crates/rustc-codegen-cuda/src/lib.rs"));
+        let build = p.build_command(Path::new("/k"));
+        assert!(
+            build.contains("export KACHE_TRUST_CODEGEN_BACKENDS=1"),
+            "{build}"
+        );
+        assert_eq!(
+            build.replace("\n# The patch declares every backend output, so the backend can be trusted.\nexport KACHE_TRUST_CODEGEN_BACKENDS=1\n", ""),
+            plain.build_command(Path::new("/k")),
+            "only the trust opt-in may differ from the plain arm's build"
+        );
+    }
+
     /// The shipped eza scenario measures both compiler families: rustc through
     /// the engine's wrapper, and the bundled libgit2/zlib objects through the
     /// host-only cc-rs wrappers `kache init` writes. It builds release, which
