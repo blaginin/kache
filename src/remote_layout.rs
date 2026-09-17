@@ -721,7 +721,7 @@ fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         DeadlineReader, DeadlineWriter, HashingWriter, RemoteLayout, V3Manifest, blob_path,
         copy_dir_all, create_entry_pack_zstd, extract_entry_pack, extract_verified_prefetch_entry,
@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     /// Build a one-file store entry and return (tmpdir, store, entry_dir).
-    fn populated_entry() -> (tempfile::TempDir, Store, std::path::PathBuf) {
+    pub(crate) fn populated_entry() -> (tempfile::TempDir, Store, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&min_config(tmp.path().join("cache"))).unwrap();
         let source_dir = tmp.path().join("source");
