@@ -47,7 +47,12 @@ pub trait CacheRemote: Send + Sync {
         &self,
         crate_names: &HashSet<String>,
     ) -> Result<HashMap<String, String>>;
+}
 
+/// v3 client-planner objects: build manifests, planner shards and
+/// packed-prefetch catalogs and packs. Only the v3 layout has them.
+#[async_trait]
+pub trait V3Prefetch: Send + Sync {
     #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_build_manifest(&self, manifest_key: &str) -> Result<Option<BuildManifest>>;
 
@@ -138,7 +143,10 @@ impl CacheRemote for V3Remote {
     ) -> Result<HashMap<String, String>> {
         self.layout().list_keys_for_crates(crate_names).await
     }
+}
 
+#[async_trait]
+impl V3Prefetch for V3Remote {
     async fn get_build_manifest(&self, manifest_key: &str) -> Result<Option<BuildManifest>> {
         remote::try_download_manifest(self.backend.as_ref(), &self.remote.prefix, manifest_key)
             .await

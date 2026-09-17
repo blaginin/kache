@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt;
 
 use std::sync::Arc;
 
+use crate::cache_remote::V3Prefetch;
 use crate::config::Config;
 use crate::daemon;
 use crate::events;
@@ -5729,8 +5730,7 @@ fn save_manifest_impl(
     let published = keys.clone();
     rt.block_on(async {
         let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
-            Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
+        let remote_cache = Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
         for (index, key) in keys.iter().enumerate() {
             let shard_namespace =
                 shard_namespace_for_publish_key(index, effective_namespace.as_deref());
@@ -5813,7 +5813,7 @@ fn manifest_entries_from_events(
 /// Takes the remote cache by reference so tests can drive it against a mock
 /// (the production caller injects a real one from `create_backend`).
 async fn upload_manifest_and_shards(
-    remote_cache: &Arc<dyn crate::cache_remote::CacheRemote>,
+    remote_cache: &Arc<crate::cache_remote::V3Remote>,
     key: &str,
     namespace: Option<&str>,
     lock_path: &std::path::Path,
@@ -5848,7 +5848,7 @@ async fn upload_manifest_and_shards(
 ///
 /// Returns the number of shards uploaded.
 async fn upload_shards(
-    remote_cache: &Arc<dyn crate::cache_remote::CacheRemote>,
+    remote_cache: &Arc<crate::cache_remote::V3Remote>,
     namespace: &str,
     lock_path: &std::path::Path,
     entries: &[crate::remote::ManifestEntry],
@@ -8713,7 +8713,7 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
         let uploaded = upload_shards(&remote_cache, "ns", &lock, &entries)
@@ -8743,7 +8743,7 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
         let uploaded = upload_shards(&remote_cache, "ns", &lock, &[])
             .await
@@ -8761,7 +8761,7 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
         let err = upload_shards(&remote_cache, "ns", &lock, &[])
@@ -10380,7 +10380,7 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
         let entries = vec![crate::remote::ManifestEntry {
             cache_key: "k".to_string(),
@@ -10406,7 +10406,7 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
         let entries = vec![crate::remote::ManifestEntry {
             cache_key: "k".to_string(),
@@ -10449,7 +10449,7 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
-        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
             Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
         upload_manifest_and_shards(&remote_cache, "mykey", Some("ns"), &lock, entries)
