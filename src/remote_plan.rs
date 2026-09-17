@@ -11,8 +11,6 @@ use crate::remote_layout::RemoteLayout;
 pub enum RemoteWorkload {
     RestoreCheck,
     Prefetch,
-    SyncPull,
-    SyncPush,
     BackgroundUpload,
     KeyDiscovery,
 }
@@ -143,8 +141,6 @@ mod tests {
         for workload in [
             RemoteWorkload::RestoreCheck,
             RemoteWorkload::Prefetch,
-            RemoteWorkload::SyncPull,
-            RemoteWorkload::SyncPush,
             RemoteWorkload::BackgroundUpload,
             RemoteWorkload::KeyDiscovery,
         ] {

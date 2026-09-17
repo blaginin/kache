@@ -17,9 +17,9 @@ use crate::remote::{self, BuildManifest, DownloadResult, Shard};
 use crate::remote_backend::{GetObject, RemoteBackend};
 use crate::remote_layout::{RemoteLayout, RemoteUploadResult};
 
-#[allow(dead_code)] // consumed once call sites move onto the trait (later task)
 #[async_trait]
 pub trait CacheRemote: Send + Sync {
+    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn exists_entry(&self, cache_key: &str, crate_name: &str) -> Result<bool>;
 
     async fn download_entry(
@@ -48,34 +48,37 @@ pub trait CacheRemote: Send + Sync {
         crate_names: &HashSet<String>,
     ) -> Result<HashMap<String, String>>;
 
+    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_build_manifest(&self, manifest_key: &str) -> Result<Option<BuildManifest>>;
 
     async fn put_build_manifest(&self, manifest_key: &str, manifest: &BuildManifest) -> Result<()>;
 
+    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_shard(&self, namespace: &str, shard_hash: &str) -> Result<Option<Shard>>;
 
     async fn put_shard(&self, namespace: &str, shard_hash: &str, shard: &Shard) -> Result<()>;
 
     /// Object keys under `prefix` for packed prefetch discovery.
+    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn list_prefetch_objects(&self, prefix: &str) -> Result<Vec<String>>;
 
     /// One packed-prefetch object (catalog or pack), capped at `max_bytes`.
+    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn get_prefetch_object(&self, key: &str, max_bytes: u64) -> Result<Option<GetObject>>;
 }
 
 /// The v3 object layout over a byte-object backend.
-#[allow(dead_code)] // consumed once call sites move onto the trait (later task)
 pub struct V3Remote {
     backend: Arc<dyn RemoteBackend>,
     remote: RemoteConfig,
 }
 
-#[allow(dead_code)] // consumed once call sites move onto the trait (later task)
 impl V3Remote {
     pub fn new(backend: Arc<dyn RemoteBackend>, remote: RemoteConfig) -> Self {
         Self { backend, remote }
     }
 
+    #[allow(dead_code)] // exercised by tests; no production caller needs the raw backend yet
     pub fn backend(&self) -> &Arc<dyn RemoteBackend> {
         &self.backend
     }
