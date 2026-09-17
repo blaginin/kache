@@ -19,7 +19,6 @@ use crate::remote_layout::{RemoteLayout, RemoteUploadResult};
 
 #[async_trait]
 pub trait CacheRemote: Send + Sync {
-    #[allow(dead_code)] // consumed once restore/prefetch call sites move onto the trait (later task)
     async fn exists_entry(&self, cache_key: &str, crate_name: &str) -> Result<bool>;
 
     async fn download_entry(
@@ -83,7 +82,6 @@ impl V3Remote {
         Self { backend, remote }
     }
 
-    #[allow(dead_code)] // exercised by tests; no production caller needs the raw backend yet
     pub fn backend(&self) -> &Arc<dyn RemoteBackend> {
         &self.backend
     }

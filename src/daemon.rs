@@ -2220,6 +2220,7 @@ pub(crate) struct Daemon {
     /// tests, which must not turn a scheduler SLA into a correctness oracle.
     local_lookup_budget: Option<Duration>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
+    v3_remote: tokio::sync::OnceCell<Arc<crate::cache_remote::V3Remote>>,
     key_cache: Arc<S3KeyCache>,
     /// Degradation breaker consulted (and fed) by every remote op: HEAD
     /// probes, restores, uploads, and key-cache LISTs (kunobi-ninja/kache#327).
@@ -2384,6 +2385,7 @@ impl Daemon {
             local_lookup_budget,
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             remote_backend: tokio::sync::OnceCell::new(),
+            v3_remote: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
             remote_breaker: Arc::new(RemoteBreaker::new()),
             negative_keys: NegativeKeyCache::new(config.remote_negative_ttl_secs),
@@ -2853,6 +2855,30 @@ impl Daemon {
                 crate::remote_backend::create_backend(remote, self.config.s3_pool_idle_secs).await
             })
             .await
+    }
+
+    /// The configured remote in the v3 layout, built once from the same
+    /// backend `get_remote_backend` returns, so test injection still applies.
+    pub(crate) async fn v3_remote(&self) -> Result<&Arc<crate::cache_remote::V3Remote>> {
+        self.v3_remote
+            .get_or_try_init(|| async {
+                let backend = Arc::clone(self.get_remote_backend().await?);
+                let remote = self
+                    .config
+                    .remote
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no remote configured"))?
+                    .clone();
+                Ok::<_, anyhow::Error>(Arc::new(crate::cache_remote::V3Remote::new(
+                    backend, remote,
+                )))
+            })
+            .await
+    }
+
+    /// Entry-level view of the configured remote.
+    pub(crate) async fn cache_remote(&self) -> Result<Arc<dyn crate::cache_remote::CacheRemote>> {
+        Ok(Arc::clone(self.v3_remote().await?) as Arc<dyn crate::cache_remote::CacheRemote>)
     }
 
     #[cfg(test)]
@@ -3433,8 +3459,8 @@ impl Daemon {
             return Response::err("retryable: write breaker open");
         };
 
-        let backend = match deadline
-            .run("upload backend initialization", self.get_remote_backend())
+        let remote_cache = match deadline
+            .run("upload backend initialization", self.cache_remote())
             .await
         {
             Ok(b) => b,
@@ -3455,7 +3481,6 @@ impl Daemon {
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::BackgroundUpload);
-        let layout = plan.layout(backend.as_ref(), remote);
 
         let head_queue_start = Instant::now();
         let head_semaphore = match deadline
@@ -3477,7 +3502,7 @@ impl Daemon {
         let already_exists = deadline
             .run(
                 "upload HEAD",
-                layout.exists_entry(&job.key, &job.crate_name),
+                remote_cache.exists_entry(&job.key, &job.crate_name),
             )
             .await;
         drop(head_semaphore);
@@ -3551,7 +3576,7 @@ impl Daemon {
         let upload_result = deadline
             .run(
                 "upload PUT",
-                layout.upload_entry_until(
+                remote_cache.upload_entry(
                     &job.key,
                     &job.crate_name,
                     &entry_dir,
@@ -3752,7 +3777,7 @@ impl Daemon {
             Ok(dir) => dir.to_path_buf(),
             Err(msg) => return Response::err(msg),
         };
-        let Some(remote) = &self.config.remote else {
+        let Some(_) = &self.config.remote else {
             return Response::err("no remote configured");
         };
 
@@ -3866,8 +3891,8 @@ impl Daemon {
             }
         }
 
-        let backend = match deadline
-            .run("demand backend initialization", self.get_remote_backend())
+        let remote_cache = match deadline
+            .run("demand backend initialization", self.cache_remote())
             .await
         {
             Ok(b) => b,
@@ -3882,7 +3907,6 @@ impl Daemon {
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
-        let layout = plan.layout(backend.as_ref(), remote);
 
         if needs_head_probe {
             let Some(breaker_permit) = self.remote_breaker.try_acquire(RemoteOperation::DemandHead)
@@ -3916,7 +3940,7 @@ impl Daemon {
             // In particular, there is no backoff sleep while the S3 permit is
             // held; a later request can retry after breaker policy admits it.
             let exists = deadline
-                .run("demand HEAD", layout.exists_entry(&req.key, cn))
+                .run("demand HEAD", remote_cache.exists_entry(&req.key, cn))
                 .await;
             head_ms += head_start.elapsed().as_millis() as u64;
             drop(semaphore_permit);
@@ -4087,7 +4111,7 @@ impl Daemon {
         let download_result = deadline
             .run(
                 "demand GET and extraction",
-                layout.download_entry_until(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
+                remote_cache.download_entry(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
             )
             .await;
         drop(semaphore_permit);
@@ -4690,14 +4714,15 @@ impl Daemon {
         };
 
         let init_deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let backend = match init_deadline
-            .run("prefetch backend initialization", self.get_remote_backend())
+        let v3_remote = match init_deadline
+            .run("prefetch backend initialization", self.v3_remote())
             .await
         {
-            Ok(backend) => backend,
+            Ok(v3_remote) => v3_remote,
             Err(error) => return Response::err(format!("remote backend init failed: {error:#}")),
         };
-        let backend = Arc::clone(backend);
+        let backend = Arc::clone(v3_remote.backend());
+        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> = v3_remote.clone();
         let bytes_at_plan_start = self.prefetch_stats.bytes_downloaded.load(Ordering::Relaxed);
 
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)
@@ -4747,13 +4772,7 @@ impl Daemon {
                 {
                     Ok(semaphore) => {
                         let result = deadline
-                            .run(
-                                "warm-all LIST",
-                                crate::remote_plan::RemotePlanner::new(&self.config)
-                                    .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                                    .layout(backend.as_ref(), remote)
-                                    .list_keys(),
-                            )
+                            .run("warm-all LIST", remote_cache.list_keys())
                             .await;
                         drop(semaphore);
                         result
@@ -4940,8 +4959,7 @@ impl Daemon {
 
                 let sem = daemon.s3_semaphore.clone();
                 let d = daemon.clone();
-                let remote_cfg = remote_config.clone();
-                let remote_backend = backend.clone();
+                let remote_cache = remote_cache.clone();
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 let plan_deadline = deadline;
@@ -5036,15 +5054,13 @@ impl Daemon {
                     let download_result = item_deadline
                         .run(
                             "prefetch GET and extraction",
-                            download_plan
-                                .layout(remote_backend.as_ref(), &remote_cfg)
-                                .download_entry_until(
-                                    &key,
-                                    &crate_name,
-                                    &entry_dir,
-                                    &blobs_dir,
-                                    item_deadline.at(),
-                                ),
+                            remote_cache.download_entry(
+                                &key,
+                                &crate_name,
+                                &entry_dir,
+                                &blobs_dir,
+                                item_deadline.at(),
+                            ),
                         )
                         .await;
                     drop(semaphore);
@@ -6822,7 +6838,7 @@ async fn drain_connection_handlers(
 
 /// Populate the key cache by listing every key in the remote.
 async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
-    let remote = daemon
+    daemon
         .config
         .remote
         .as_ref()
@@ -6835,11 +6851,11 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         anyhow::bail!("remote degraded — key cache refresh suppressed");
     };
     let deadline = RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
-    let backend = match deadline
-        .run("index backend initialization", daemon.get_remote_backend())
+    let remote_cache = match deadline
+        .run("index backend initialization", daemon.cache_remote())
         .await
     {
-        Ok(backend) => backend,
+        Ok(remote_cache) => remote_cache,
         Err(error) => {
             let class = classify_remote_error(&error);
             breaker_permit.failure(class, &format!("{error:#}"));
@@ -6871,15 +6887,7 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
             return Err(error);
         }
     };
-    let list_result = deadline
-        .run(
-            "index LIST",
-            crate::remote_plan::RemotePlanner::new(&daemon.config)
-                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(backend.as_ref(), remote)
-                .list_keys(),
-        )
-        .await;
+    let list_result = deadline.run("index LIST", remote_cache.list_keys()).await;
     drop(semaphore);
     let keys = match list_result {
         Ok(keys) => keys,
@@ -13656,6 +13664,30 @@ mod tests {
 
     fn test_remote_backend() -> Arc<dyn crate::remote_backend::RemoteBackend> {
         Arc::new(crate::remote_backend::memory_backend())
+    }
+
+    #[tokio::test]
+    async fn cache_remote_wraps_the_injected_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Daemon::new(config);
+        daemon.set_remote_backend_for_test(Arc::clone(&backend));
+        let remote_cache = daemon.cache_remote().await.unwrap();
+        backend
+            .put(
+                "prefix/v3/manifests/foo/k1.json",
+                b"{}".to_vec(),
+                Some("application/json"),
+            )
+            .await
+            .unwrap();
+        assert!(remote_cache.exists_entry("k1", "foo").await.unwrap());
+        assert!(Arc::ptr_eq(
+            daemon.v3_remote().await.unwrap(),
+            daemon.v3_remote().await.unwrap()
+        ));
     }
 
     struct BlockingIdentityBackend {
